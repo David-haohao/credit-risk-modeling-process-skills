@@ -1,6 +1,6 @@
 ---
 name: credit-a-card-modeling
-description: "Use when building or reviewing an application credit scorecard workflow, including sample preparation, EDA, feature engineering, LR/XGBoost/LightGBM training, evaluation, score conversion, or monitoring."
+description: "Use when building or reviewing an application credit scorecard workflow, including sample preparation, EDA, feature engineering, LR/XGBoost/LightGBM training, evaluation, score conversion, or final reporting."
 ---
 
 # A 卡建模
@@ -41,7 +41,7 @@ description: "Use when building or reviewing an application credit scorecard wor
 | 4 | LR / XGBoost / LightGBM 训练 | `references/4-model-training.md`；仅当 `model_type` 为 XGB/LGB 时额外读取 `references/4.1-xgb-lgb-tuning.md` |
 | 5 | KS / AUC / LIFT / PSI / 校准度评估 | `references/5-model-evaluation.md` |
 | 6 | 概率校准、分数映射与风险等级 | `references/6-scorecard.md` |
-| 7 | 上线交付与持续监控 | `references/7-deployment-monitoring.md` |
+| 7 | 最终报告汇总与交付 | `references/7-final-report.md` |
 
 ## 执行方式
 
@@ -63,4 +63,4 @@ description: "Use when building or reviewing an application credit scorecard wor
 | 4 | `scripts/04_model_training.py` |
 | 5 | `scripts/05_model_evaluation.py` |
 | 6 | `scripts/06_scorecard.py` |
-| 7 | `scripts/07_monitoring.py` |
+| 7 | `scripts/07_final_report.py` |
