@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""阶段 0：环境初始化与数据预检 —— 依赖检查、数据加载、缺失值探测、数据规模预检。"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import os
+import sys
+from typing import Any
+
+import numpy as np
+import pandas as pd
+
+
+# =============================================================================
+# 依赖检查
+# =============================================================================
+
+REQUIRED_PACKAGES: dict[str, str] = {
+    "pandas": "1.0+",
+    "numpy": "1.18+",
+    "matplotlib": "3.0+",
+    "seaborn": "0.10+",
+    "plotly": "5.0+",
+    "toad": "0.1.0+",
+    "xgboost": "1.5+",
+    "lightgbm": "3.0+",
+    "optuna": "2.0+",
+    "sklearn": "0.24+",
+    "scipy": "1.5+",
+    "statsmodels": "0.12+",
+}
+
+
+def check_packages() -> bool:
+    """检查所有依赖包，返回是否全部就绪。"""
+    missing: list[str] = []
+    for pkg, version in REQUIRED_PACKAGES.items():
+        try:
+            mod = importlib.import_module(pkg)
+            actual = getattr(mod, "__version__", "unknown")
+            print(f"  [OK] {pkg} == {actual}")
+        except ImportError:
+            print(f"  [MISSING] {pkg} ({version})")
+            missing.append(pkg)
+
+    if missing:
+        print(f"\n缺少以下包，请先安装：")
+        print(f"  pip install {' '.join(missing)}")
+        return False
+    else:
+        print(f"\n所有依赖包已就绪。")
+        return True
+
+
+# =============================================================================
+# 中文字体配置
+# =============================================================================
+
+def setup_chinese_font() -> None:
+    """配置 matplotlib 中文字体与 seaborn 样式。"""
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    try:
+        plt.rcParams["font.sans-serif"] = ["SimHei", "DejaVu Sans"]
+        plt.rcParams["axes.unicode_minus"] = False
+    except Exception:
+        print("注意：未检测到中文字体，图表可能显示异常。")
+
+    sns.set_style("whitegrid")
+
+
+# =============================================================================
+# 数据加载
+# =============================================================================
+
+def load_data(filepath: str) -> pd.DataFrame:
+    """按后缀加载 CSV / Excel / Parquet。"""
+    if filepath.endswith(".csv"):
+        return pd.read_csv(filepath, encoding="utf-8-sig")
+    elif filepath.endswith((".xlsx", ".xls")):
+        return pd.read_excel(filepath)
+    elif filepath.endswith(".parquet"):
+        return pd.read_parquet(filepath)
+    else:
+        raise ValueError(f"不支持的文件格式: {filepath}")
+
+
+# =============================================================================
+# 数据规模预检
+# =============================================================================
+
+def data_scale_check(filepath: str) -> tuple[int, int, float]:
+    """检查数据规模，输出性能预警。"""
+    file_size_mb = os.path.getsize(filepath) / (1024 * 1024)
+    print(f"文件大小: {file_size_mb:.0f} MB")
+
+    if filepath.endswith(".csv"):
+        df_head = pd.read_csv(filepath, nrows=5, encoding="utf-8-sig")
+        with open(filepath, "r", encoding="utf-8-sig") as f:
+            n_rows = sum(1 for _ in f) - 1
+    else:
+        data = load_data(filepath)
+        df_head = data.head()
+        n_rows = len(data)
+
+    n_cols = len(df_head.columns)
+    n_features = max(0, n_cols - 4)
+    print(f"列数: {n_cols}")
+    print(f"行数: {n_rows}")
+    if n_rows > 200_000 or n_features > 200:
+        print("⚠️ 预警: 数据规模较大，请评估运行时间与内存。")
+        print("  模型类型应依据业务可解释性、有效样本量和 bad 样本数量确认。")
+        print("  预筛选、分批处理或采样加速应根据实际性能测试决定。")
+
+    return n_rows, n_cols, file_size_mb
+
+
+# =============================================================================
+# 缺失值探测与统一
+# =============================================================================
+
+def detect_missing_markers(data: pd.DataFrame) -> None:
+    """探测 NaN 数量和常见特殊值（-9999, -999, -99999）的分布。"""
+    print("=== NaN 数量（前 20 列）===")
+    nan_counts = data.isna().sum()
+    print(nan_counts[nan_counts > 0].head(20))
+
+    print("\n=== 特殊值检查 ===")
+    special_markers = [-9999, -999, -99999]
+    for col in data.select_dtypes(include=[np.number]).columns[:30]:
+        for marker in special_markers:
+            count = (data[col] == marker).sum()
+            if count > 0:
+                print(f"[WARN] {col}: {marker} 出现 {count} 次")
+
+
+def unify_missing(df: pd.DataFrame, markers: list[Any]) -> pd.DataFrame:
+    """将特殊缺失标识统一转换为 NaN。"""
+    df = df.copy()
+    for col in df.columns:
+        for marker in markers:
+            df.loc[df[col] == marker, col] = np.nan
+    return df
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="阶段 0：环境初始化与数据预检"
+    )
+    parser.add_argument("--filepath", required=True, help="数据文件路径（csv/xlsx/parquet）")
+    parser.add_argument("--check-packages", action="store_true", help="检查依赖包")
+    parser.add_argument("--missing-markers", nargs="*", type=float,
+                        default=[-9999, -999], help="特殊缺失值标识，默认 -9999 -999")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    if args.check_packages:
+        ok = check_packages()
+        if not ok:
+            sys.exit(1)
+
+    setup_chinese_font()
+
+    n_rows, n_cols, file_size_mb = data_scale_check(args.filepath)
+
+    df = load_data(args.filepath)
+    detect_missing_markers(df)
+
+    if args.missing_markers:
+        df = unify_missing(df, args.missing_markers)
+        print(f"\n已将 {args.missing_markers} 统一转换为 NaN")
+
+
+if __name__ == "__main__":
+    main()
