@@ -116,13 +116,18 @@ PSI 参考区间可展示为：
 
 ## 5.4 校准度评估
 
-阶段 5 只判断是否需要校准，不执行校准。对各可用数据集输出：
+阶段 5 不执行校准，只评估原始概率的校准度。对各可用数据集输出：
 
 - Brier Score。
 - Log Loss。
 - Reliability Curve。
 - 校准截距与校准斜率。
 - 各概率分箱的平均预测概率、实际坏账率、样本数与差异。
+
+模型进入阶段 6 后的处理规则：
+
+- **LR**：根据阶段 5 校准评估结果，由用户确认直接使用原始概率，或在阶段 6 执行校准。
+- **XGB/LGB**：阶段 6 必须执行概率校准，并输出校准前后对比；阶段 5 的校准评估用于记录原始概率偏差和建立对比基准，不用于决定是否跳过校准。
 
 输出：
 
@@ -188,7 +193,7 @@ confirmed_by, confirmed_at
 | Train/Test/OOT 的 KS/AUC 绝对表现与差异 | `overfitting` / `underfitting` / `data_or_split_issue` | 接受、返回阶段 1/3/4、拒绝模型 |
 | 固定分箱坏账率排序、分箱 Lift 与累计 Lift | `ranking_issue` | 接受、返回阶段 3/4 |
 | Train-OOT 整体及周期 PSI | `data_shift` | 接受、调整观察粒度、返回阶段 1/3、拒绝模型 |
-| Brier、Log Loss、Reliability、校准截距/斜率 | `poor_calibration` | 接受原始概率、阶段 6 校准、拒绝模型 |
+| Brier、Log Loss、Reliability、校准截距/斜率 | `poor_calibration` | LR：接受原始概率或阶段 6 校准；XGB/LGB：阶段 6 必须校准 |
 
 任一核心决策仍为 `pending` 时，不得进入阶段 6。
 
