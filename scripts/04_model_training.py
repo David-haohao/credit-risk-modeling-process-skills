@@ -25,7 +25,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from statsmodels.stats.outliers_influence import variance_inflation_factor
-from stage_contracts import load_config, load_previous_manifest, require_formal_entry, write_stage_manifest
+from stage_contracts import load_config, load_previous_manifest, require_formal_entry, write_output_list, write_stage_manifest
 
 
 DECISION_COLUMNS = [
@@ -565,6 +565,14 @@ def main() -> None:
         save_process_plot(history, "iteration", "criterion_after", str(output / "04_lr_criterion_curve.png"),
                           f"LR Stepwise {args.stepwise_criterion.upper()} History")
         if not decisions.empty and (decisions["decision"] == "pending").any():
+            write_output_list(output / "04-output-list.xlsx",
+                              pd.DataFrame([{"status": "pending", "reason": "lr_model_decisions"}]),
+                              list(output.glob("04_*")), decisions.loc[decisions["decision"].eq("pending")])
+            outputs = {path.stem: path for path in output.glob("04_*")}
+            outputs["04_output_list"] = output / "04-output-list.xlsx"
+            write_stage_manifest(output, 4, "pending", config_path,
+                                 {"previous_manifest": args.previous_manifest or ""}, outputs,
+                                 decisions.loc[decisions["decision"].eq("pending")].to_dict("records"), 5)
             print("存在待确认 LR 诊断项，已输出 04_model_decisions.csv，确认后重新执行阶段 4。")
             return
         selected = apply_model_decisions(selected, decisions)

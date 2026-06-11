@@ -25,6 +25,21 @@ ADJUSTMENT_COLUMNS = [
 ]
 
 
+def write_stage3_pending(
+    output_dir: str, config_path: Path, previous_manifest: Optional[str], reason: str,
+) -> None:
+    output = Path(output_dir)
+    pending = pd.DataFrame([{"issue_type": reason, "decision": "pending"}])
+    artifacts = list(output.glob("03_*"))
+    write_output_list(output / "03-output-list.xlsx", pd.DataFrame([{"status": "pending", "reason": reason}]),
+                      artifacts, pending)
+    outputs = {path.stem: path for path in output.glob("03_*")}
+    outputs["03_output_list"] = output / "03-output-list.xlsx"
+    write_stage_manifest(output, 3, "pending", config_path,
+                         {"previous_manifest": previous_manifest or ""}, outputs,
+                         pending.to_dict("records"), 4)
+
+
 def apply_quality_actions(
     datasets: dict[str, pd.DataFrame], decisions: pd.DataFrame,
 ) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
@@ -635,6 +650,7 @@ def main() -> None:
             rules["decision"] = rules["decision"].fillna("pending")
         rules.to_csv(f"{args.output_dir}/03_rule_candidates.csv", index=False, encoding="utf-8-sig")
         if (rules["decision"] == "pending").any():
+            write_stage3_pending(args.output_dir, config_path, args.previous_manifest, "rule_candidate_confirmation")
             print("候选规则变量尚未确认，已暂停阶段 3。")
             return
         remove_rules = set(rules.loc[rules["decision"].isin(["rule", "drop"]), "feature"])
@@ -685,6 +701,7 @@ def main() -> None:
             before_summary.rename(columns={"feature": "column"}).to_csv(
                 f"{args.output_dir}/03_iv_table.csv", index=False, encoding="utf-8-sig",
             )
+            write_stage3_pending(args.output_dir, config_path, args.previous_manifest, "lr_feature_adjustment_confirmation")
             print("存在非单调特征，已输出 03_feature_adjustments.csv，确认后重新执行阶段 3。")
             return
 
@@ -805,6 +822,7 @@ def main() -> None:
     iv_table.to_csv(f"{args.output_dir}/03_iv_table.csv", index=False, encoding="utf-8-sig")
     report_iv_distribution(iv_table)
     if adjustment_requires_review:
+        write_stage3_pending(args.output_dir, config_path, args.previous_manifest, "lr_adjustment_reconfirmation")
         print("人工调整后仍存在非单调特征，已更新调整明细，请重新确认后再执行阶段 3。")
         return
 
