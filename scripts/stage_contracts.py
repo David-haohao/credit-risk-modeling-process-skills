@@ -102,6 +102,7 @@ def write_stage_manifest(
         "stage": stage,
         "status": status,
         "created_at": now_iso(),
+        "config_path": str(Path(config_path).resolve()),
         "config_snapshot": str(snapshot),
         "inputs": {k: str(v) for k, v in inputs.items()},
         "outputs": declared_outputs,

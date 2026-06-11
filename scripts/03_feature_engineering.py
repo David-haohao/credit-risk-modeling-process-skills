@@ -522,13 +522,13 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="阶段 3：特征工程"
     )
-    parser.add_argument("--train", required=True, help="训练集 CSV（阶段 1 输出）")
+    parser.add_argument("--train", help="兼容模式训练集 CSV")
     parser.add_argument("--previous-manifest")
     parser.add_argument("--compatibility-mode", action="store_true")
     parser.add_argument("--config")
     parser.add_argument("--test", help="测试集 CSV（XGB/LGB 路径必需）")
-    parser.add_argument("--oot", required=True, help="OOT CSV（阶段 1 输出）")
-    parser.add_argument("--target-col", required=True, help="Y_label 列名")
+    parser.add_argument("--oot", help="兼容模式 OOT CSV")
+    parser.add_argument("--target-col", help="Y_label 列名")
     parser.add_argument("--time-col", help="时间字段，保留但不入模")
     parser.add_argument("--reserved-cols", nargs="*", default=["sample_id", "sample_weight"],
                         help="保留但不入模的字段，如 sample_id、时间字段、sample_weight")
@@ -561,8 +561,13 @@ def main() -> None:
     args = parse_args()
     require_formal_entry(args.previous_manifest, args.compatibility_mode, 3)
     manifest = load_previous_manifest(args.previous_manifest, 2) if args.previous_manifest else None
-    config_path = Path(args.config or (manifest or {}).get("config_snapshot", ""))
+    config_path = Path(args.config or (manifest or {}).get("config_path", ""))
     config = load_config(config_path) if config_path.exists() else {}
+    declared = (manifest or {}).get("outputs", {})
+    args.train = args.train or declared.get("train")
+    args.test = args.test or declared.get("test")
+    args.oot = args.oot or declared.get("oot")
+    args.quality_decisions = args.quality_decisions or declared.get("02_quality_decisions")
     fields = config.get("fields", {})
     stage3_config = config.get("stage3", {})
     args.target_col = fields.get("target_col", args.target_col)
@@ -572,6 +577,8 @@ def main() -> None:
         args.iv_threshold = float(stage3_config["iv_threshold"])
     if stage3_config.get("corr_threshold") not in {None, "pending"}:
         args.corr_threshold = float(stage3_config["corr_threshold"])
+    if not args.train or not args.oot or not args.target_col:
+        raise ValueError("阶段 3 manifest/config 缺少 Train、OOT 或 target_col")
     import os as _os
     _os.makedirs(args.output_dir, exist_ok=True)
 
@@ -588,6 +595,7 @@ def main() -> None:
     active_features = [
         c for c in train.columns if c not in set(reserved_cols + [args.target_col])
     ]
+    original_candidate_features = active_features.copy()
 
     # 应用阶段 2 已确认的质量决策
     if args.quality_decisions:
@@ -846,7 +854,7 @@ def main() -> None:
         "feature": feature,
         "final_status": "selected" if feature in selected_set else "dropped",
         "reason": "final_feature_set" if feature in selected_set else "feature_screening",
-    } for feature in active_features])
+    } for feature in original_candidate_features])
     feature_decisions.to_csv(output / "03_feature_decisions.csv", index=False, encoding="utf-8-sig")
     config.setdefault("stage3", {}).update({
         "iv_threshold": args.iv_threshold, "corr_threshold": args.corr_threshold,
@@ -859,7 +867,7 @@ def main() -> None:
     write_output_list(output / "03-output-list.xlsx", summary, artifacts,
                       extra_sheets={"feature_decisions": feature_decisions})
     outputs = {path.stem: path for path in output.glob("03_*")}
-    outputs["output_list"] = output / "03-output-list.xlsx"
+    outputs["03_output_list"] = output / "03-output-list.xlsx"
     write_stage_manifest(output, 3, "completed", config_path,
                          {"previous_manifest": args.previous_manifest or ""}, outputs, [], 4)
 

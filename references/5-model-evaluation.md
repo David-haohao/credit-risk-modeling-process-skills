@@ -1,12 +1,14 @@
 # 阶段 5：模型评估
 
-> **可执行脚本**：`scripts/05_model_evaluation.py`。阶段 5 reference 完成确认后，再同步脚本实现。
+> **可执行脚本**：`scripts/05_model_evaluation.py`
 
 ## 5.0 阶段目的与输入契约
 
 阶段 5 只负责诊断阶段 4 已冻结模型的原始预测，不在阶段 5 内直接重新训练、调参或执行概率校准。评估不通过时，必须根据问题原因回退至阶段 1、3 或 4 处理并重新执行后续评估。评估通过后的路由由阶段 0 的 `enable_stage6_scoring` 决定。
 
 ### 核心输入
+
+正式运行必须读取 `04_stage_manifest.json`，并从 manifest 获取预测、模型元数据和主配置路径。
 
 | 文件 | 必需性 | 用途 |
 |------|--------|------|
@@ -218,6 +220,7 @@ confirmed_by, confirmed_at
 | `05_evaluation_decisions.csv` | 模型评估决策表 |
 | `05_rework_history.csv` | 回退处理、模型版本与重新评估记录；无回退时可为空表 |
 | `05-output-list.xlsx` | 阶段 5 输出索引与用户审阅汇总 |
+| `05_stage_manifest.json` | 阶段 5 正式交接清单；按项目范围路由至阶段 6 或阶段 7 |
 
 验收规则：
 

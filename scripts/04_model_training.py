@@ -455,15 +455,15 @@ def save_model(model: Any, path: str) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="阶段 4：可审计模型训练")
-    parser.add_argument("--model-type", choices=["LR", "XGB", "LGB"], required=True)
+    parser.add_argument("--model-type", choices=["LR", "XGB", "LGB"])
     parser.add_argument("--previous-manifest")
     parser.add_argument("--compatibility-mode", action="store_true")
     parser.add_argument("--config")
-    parser.add_argument("--train", required=True)
+    parser.add_argument("--train")
     parser.add_argument("--test")
-    parser.add_argument("--oot", required=True)
-    parser.add_argument("--features-file", required=True)
-    parser.add_argument("--target-col", required=True)
+    parser.add_argument("--oot")
+    parser.add_argument("--features-file")
+    parser.add_argument("--target-col")
     parser.add_argument("--sample-id-col", default="sample_id")
     parser.add_argument("--weight-col", default="sample_weight")
     parser.add_argument("--time-col", help="保留到预测文件中的时间字段")
@@ -489,8 +489,9 @@ def main() -> None:
     args = parse_args()
     require_formal_entry(args.previous_manifest, args.compatibility_mode, 4)
     manifest = load_previous_manifest(args.previous_manifest, 3) if args.previous_manifest else None
-    config_path = Path(args.config or (manifest or {}).get("config_snapshot", ""))
+    config_path = Path(args.config or (manifest or {}).get("config_path", ""))
     config = load_config(config_path) if config_path.exists() else {}
+    declared = (manifest or {}).get("outputs", {})
     fields = config.get("fields", {})
     training = config.get("training", {})
     args.model_type = config.get("model_type", args.model_type)
@@ -499,12 +500,22 @@ def main() -> None:
     args.weight_col = fields.get("sample_weight_col", args.weight_col)
     args.time_col = fields.get("time_col", args.time_col)
     args.n_trials = int(training.get("n_trials", args.n_trials))
+    if args.model_type == "LR":
+        args.train = args.train or declared.get("03_train_woe")
+        args.oot = args.oot or declared.get("03_oot_woe")
+    else:
+        args.train = args.train or declared.get("03_train_final")
+        args.test = args.test or declared.get("03_test_final")
+        args.oot = args.oot or declared.get("03_oot_final")
+    args.features_file = args.features_file or declared.get("03_final_features")
+    if not all([args.model_type, args.train, args.oot, args.features_file, args.target_col]):
+        raise ValueError("阶段 4 manifest/config 缺少模型类型、数据、特征列表或 target_col")
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     if args.model_type == "LGB":
         require_lightgbm()
-    if args.model_type == "XGB" and not args.test:
-        raise ValueError("XGB 路径必须提供 --test")
+    if args.model_type in {"XGB", "LGB"} and not args.test:
+        raise ValueError("XGB/LGB 路径必须提供 --test")
 
     train = pd.read_csv(args.train, sep=args.sep, encoding="utf-8-sig")
     oot = pd.read_csv(args.oot, sep=args.sep, encoding="utf-8-sig")
@@ -666,7 +677,7 @@ def main() -> None:
         })
     save_excel(str(output / "04-output-list.xlsx"), workbook_sheets)
     outputs = {path.stem: path for path in output.glob("04_*")}
-    outputs["output_list"] = output / "04-output-list.xlsx"
+    outputs["04_output_list"] = output / "04-output-list.xlsx"
     write_stage_manifest(output, 4, "completed", config_path,
                          {"previous_manifest": args.previous_manifest or ""}, outputs, [], 5)
     print(f"阶段 4 完成，最终特征数: {len(selected)}")

@@ -23,6 +23,7 @@ def load_script(name):
 
 CONTRACTS = load_script("stage_contracts.py")
 STAGE1 = load_script("01_data_prep.py")
+STAGE2 = load_script("02_eda.py")
 STAGE3 = load_script("03_feature_engineering.py")
 
 
@@ -41,6 +42,14 @@ class ContractTests(unittest.TestCase):
             self.assertTrue(Path(manifest["config_snapshot"]).exists())
             with self.assertRaises(ValueError):
                 CONTRACTS.require_formal_entry(None, compatibility_mode=False, stage=1)
+            next_manifest_path = CONTRACTS.write_stage_manifest(
+                root, 1, "completed", config, {"previous_manifest": str(manifest_path)},
+                {"train": str(root / "01_train.csv")}, [], 2,
+            )
+            next_manifest = json.loads(next_manifest_path.read_text(encoding="utf-8"))
+            self.assertIn("config", next_manifest["outputs"])
+            self.assertIn("train", next_manifest["outputs"])
+            self.assertEqual(next_manifest["config_path"], str(config.resolve()))
 
     def test_output_workbook_contains_summary_inventory_and_pending(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -80,6 +89,11 @@ class Stage1Tests(unittest.TestCase):
         self.assertEqual(first["sample_id"].nunique(), len(first))
         self.assertNotEqual(first.loc[0, "sample_id"], first.loc[1, "sample_id"])
 
+    def test_composite_source_columns_drive_generated_id(self):
+        data = pd.DataFrame({"customer": [1, 1], "application": [10, 11], "noise": ["a", "a"]})
+        result = STAGE1.ensure_sample_id(data, None, ["customer", "application"])
+        self.assertEqual(result["sample_id"].nunique(), 2)
+
 
 class Stage3QualityActionTests(unittest.TestCase):
     def test_structured_quality_actions_apply_consistently(self):
@@ -104,6 +118,16 @@ class Stage3QualityActionTests(unittest.TestCase):
         }])
         with self.assertRaises(ValueError):
             STAGE3.apply_quality_actions({"train": pd.DataFrame({"x": [1]})}, decisions)
+
+
+class Stage2ConfiguredQualityTests(unittest.TestCase):
+    def test_optional_quality_checks_require_configuration(self):
+        data = pd.DataFrame({"x": [None, None, 1], "cat": ["a", "a", "b"]})
+        self.assertEqual(STAGE2.configured_quality_candidates(data, ["x", "cat"], {}), [])
+        candidates = STAGE2.configured_quality_candidates(
+            data, ["x", "cat"], {"high_missing_rate": 0.5, "sparse_category_rate": 0.4},
+        )
+        self.assertEqual({row["issue_type"] for row in candidates}, {"high_missing", "sparse_category"})
 
 
 if __name__ == "__main__":

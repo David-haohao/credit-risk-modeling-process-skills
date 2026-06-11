@@ -1,6 +1,6 @@
 # 阶段 6：概率校准、分数尺度变换与风险等级
 
-> **可执行脚本**：`scripts/06_scorecard.py`。阶段 6 reference 完成确认后，再同步脚本实现。
+> **可执行脚本**：`scripts/06_scorecard.py`
 
 ## 6.0 阶段目的与入口
 
@@ -26,6 +26,8 @@
 ## 6.1 输入契约
 
 ### 核心输入
+
+正式运行必须读取 `05_stage_manifest.json`，并仅通过 manifest 获取累计声明的模型、预测、阶段 5 决策、LR 分箱及主配置路径。
 
 | 输入 | 用途 |
 |------|------|
@@ -304,6 +306,8 @@ score_difference = score_from_card - score_from_probability
 
 灰样本输出只展示分数、等级、数量和占比，不计算坏账率、KS、AUC等需要真实标签的指标。
 
+通用阶段 6 脚本只消费已通过最终特征处理链生成的灰样本原始预测。存在灰样本但 manifest 未声明可复用的灰样本预测时必须阻断，不得直接使用未处理原始特征猜测预测结果。
+
 ---
 
 ## 6.7 决策表
@@ -353,6 +357,7 @@ score_raw, score, risk_grade, sample_weight（如存在）
 | `06_scorecard_validation.csv` | LR 概率映射分与分箱加总分一致性验证 |
 | `06_scoring_decisions.csv` | 阶段 6 人工决策 |
 | `06-output-list.xlsx` | 阶段 6 输出索引与审阅汇总 |
+| `06_stage_manifest.json` | 阶段 6 正式交接清单 |
 
 ### 验收规则
 

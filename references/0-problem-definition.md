@@ -215,6 +215,7 @@ IV 阈值**不应在阶段 0 固定**，而应在阶段 3 先输出 IV 分布后
 | `00-output-list.xlsx` | 配置、检查结果和用户确认记录汇总 |
 | `00_environment_check.csv` | 依赖包及运行环境检查明细 |
 | `00_data_profile.csv` | 文件规模、字段数量、类型和基础质量预检 |
+| `00_stage_manifest.json` | 阶段 0 正式交接清单；仅在阶段 0 必需确认项完成后标记为 `completed` |
 
 ### 0.6.4 阶段验收规则
 

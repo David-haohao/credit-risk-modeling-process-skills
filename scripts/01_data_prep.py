@@ -171,7 +171,9 @@ def missing_report(data: pd.DataFrame, target_col: str) -> pd.DataFrame:
     return report.reset_index(drop=True)
 
 
-def ensure_sample_id(data: pd.DataFrame, sample_id_col: Optional[str]) -> pd.DataFrame:
+def ensure_sample_id(
+    data: pd.DataFrame, sample_id_col: Optional[str], source_cols: Optional[list[str]] = None,
+) -> pd.DataFrame:
     """固化统一 sample_id；未指定主键时使用原始行号生成。"""
     data = data.copy()
     if sample_id_col:
@@ -183,7 +185,11 @@ def ensure_sample_id(data: pd.DataFrame, sample_id_col: Optional[str]) -> pd.Dat
         if sample_id_col != "sample_id":
             data = data.drop(columns=[sample_id_col])
     else:
-        normalized = data.astype("string").fillna("__MISSING__")
+        if source_cols:
+            missing = [col for col in source_cols if col not in data.columns]
+            if missing:
+                raise ValueError(f"样本唯一标识组合字段不存在: {missing}")
+        normalized = data[source_cols].astype("string").fillna("__MISSING__") if source_cols else data.astype("string").fillna("__MISSING__")
         content_hash = normalized.apply(
             lambda row: hashlib.sha256(
                 json.dumps(row.tolist(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -205,12 +211,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="阶段 1：数据准备与样本划分"
     )
-    parser.add_argument("--input", required=True, help="输入 CSV 路径")
+    parser.add_argument("--input", help="兼容模式输入 CSV 路径")
     parser.add_argument("--previous-manifest", help="阶段 0 正式交接 manifest")
     parser.add_argument("--compatibility-mode", action="store_true", help="允许直接文件参数运行")
     parser.add_argument("--config", help="00_modeling_config.yaml")
-    parser.add_argument("--target-col", required=True, help="Y_label 列名")
-    parser.add_argument("--time-col", required=True, help="时间列名")
+    parser.add_argument("--target-col", help="Y_label 列名")
+    parser.add_argument("--time-col", help="时间列名")
     parser.add_argument("--sample-id-col", help="原始样本唯一标识列；未提供时按原始行号生成 sample_id")
     parser.add_argument("--output-dir", default="./output", help="输出目录")
     parser.add_argument("--model-type", choices=["LR", "XGB", "LGB"], default="XGB",
@@ -236,21 +242,25 @@ def main() -> None:
     args = parse_args()
     require_formal_entry(args.previous_manifest, args.compatibility_mode, 1)
     manifest = load_previous_manifest(args.previous_manifest, 0) if args.previous_manifest else None
-    config_path = Path(args.config or (manifest or {}).get("outputs", {}).get("config", ""))
+    config_path = Path(args.config or (manifest or {}).get("config_path", ""))
     config = load_config(config_path) if config_path.exists() else {}
+    args.input = args.input or (manifest or {}).get("inputs", {}).get("raw_data")
     fields = config.get("fields", {})
     split_config = config.get("sample_split", {})
     args.target_col = fields.get("target_col", args.target_col)
     args.time_col = fields.get("time_col", args.time_col)
     args.sample_id_col = fields.get("sample_id_col", args.sample_id_col)
+    sample_id_source_cols = fields.get("sample_id_source_cols") or []
     args.model_type = config.get("model_type", args.model_type)
     args.oot_method = split_config.get("oot_method", args.oot_method)
     args.oot_start_date = split_config.get("oot_start_date", args.oot_start_date)
     args.oot_months = split_config.get("oot_months", args.oot_months)
     args.oot_proportion = split_config.get("oot_proportion", args.oot_proportion)
+    if not args.input or not args.target_col or not args.time_col:
+        raise ValueError("阶段 1 manifest/config 缺少原始数据、target_col 或 time_col")
 
     df = pd.read_csv(args.input, sep=args.sep, encoding="utf-8-sig")
-    df = ensure_sample_id(df, args.sample_id_col)
+    df = ensure_sample_id(df, args.sample_id_col, sample_id_source_cols)
     print(f"加载数据: {len(df)} 行, {len(df.columns)} 列")
 
     # 灰样本处理
@@ -323,6 +333,7 @@ def main() -> None:
         "oot_months": args.oot_months, "oot_proportion": args.oot_proportion,
         "test_size": args.test_size, "random_state": args.random_state,
     })
+    config.setdefault("fields", {})["sample_id_col"] = "sample_id"
     if config_path:
         write_config(config_path, config)
     outputs = {
@@ -338,7 +349,7 @@ def main() -> None:
         outputs["grey"] = output / "01_grey_samples.csv"
     summary = pd.DataFrame([{"model_type": args.model_type, "oot_method": args.oot_method, "status": "completed"}])
     write_output_list(output / "01-output-list.xlsx", summary, list(outputs.values()))
-    outputs["output_list"] = output / "01-output-list.xlsx"
+    outputs["01_output_list"] = output / "01-output-list.xlsx"
     write_stage_manifest(output, 1, "completed", config_path, {"previous_manifest": args.previous_manifest or ""}, outputs, [], 2)
 
     print(f"\n输出已保存至: {args.output_dir}")

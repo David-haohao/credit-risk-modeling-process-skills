@@ -16,7 +16,8 @@
 
 | 输入 | 必需内容 | 用途 |
 |------|----------|------|
-| `01_train.csv` | `sample_id`、Y_label、时间字段、候选特征及可选 `sample_weight` | 仅使用 Train 执行 EDA 和质量检查 |
+| `01_stage_manifest.json` | 阶段 1 正式交接入口 | 获取 Train 和主配置路径 |
+| `01_train.csv` | 通过 manifest 获取；`sample_id`、Y_label、时间字段、候选特征及可选 `sample_weight` | 仅使用 Train 执行 EDA 和质量检查 |
 | `00_modeling_config.yaml` | 字段定义、标签定义、缺失值配置、保留字段列表 | 驱动分析并排除非特征字段 |
 
 `sample_id`、Y_label、时间字段、`sample_weight` 属于保留字段。除专门分析 Y_label 和时间分布外，不得参与特征质量统计、相关性分析或候选特征结论。
@@ -125,6 +126,8 @@ EDA 在**训练集**上进行（避免数据泄露到验证集/OOT）。所有�
 
 ## 2.5 数据质量检查
 
+高缺失、稀疏类别和类型异常只在 `00_modeling_config.yaml` 的 `eda_quality_thresholds` 明确配置后检测。支持 `high_missing_rate`、`sparse_category_rate` 和 `expected_types` 字段；未配置时记录未执行，不使用隐藏默认阈值。
+
 ### 2.5.1 时间泄露风险检查
 
 计算各数值特征与时间列的相关系数，|r| > 0.5 的特征标记为可疑。
@@ -200,6 +203,7 @@ EDA 在**训练集**上进行（避免数据泄露到验证集/OOT）。所有�
 | `02_categorical_stats.csv` | 离散特征各取值 count + pct |
 | `02_time_leakage.csv` | 时间泄露风险检查结果 |
 | `02_extreme_values.csv` | 极端值检查结果 |
+| `02_stage_manifest.json` | 阶段 2 正式交接清单；仅未确认时间泄露项阻断阶段 3 |
 
 ### 2.6.4 阶段验收规则
 

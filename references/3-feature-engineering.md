@@ -15,6 +15,8 @@
 
 ### 执行必需输入
 
+正式运行首先读取 `02_stage_manifest.json`，并仅通过该 manifest 获取累计声明的阶段 0-2 产物路径。
+
 | 输入 | 必需字段/内容 | 用途 |
 |------|--------------|------|
 | `01_train.csv` | `sample_id`、Y_label、候选特征；抽样时包含 `sample_weight` | 仅使用 Train 拟合筛选规则、分箱和转换器 |
@@ -337,6 +339,7 @@ LR 路径使用 `toad.Combiner` 在 Train 上拟合分箱规则，再使用一�
 | `03_combiner.pkl` | LR 分箱规则对象 |
 | `03_woe_transformer.pkl` | LR 平滑 WOE 映射对象，包含平滑参数和各箱映射 |
 | `03_final_features.txt` | 最终模型特征列表，不包含保留字段 |
+| `03_stage_manifest.json` | 阶段 3 正式交接清单 |
 
 ---
 

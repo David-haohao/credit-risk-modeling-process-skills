@@ -13,6 +13,8 @@ description: "Use when building or reviewing an application credit scorecard wor
 
 统一使用 `00_modeling_config.yaml` 传递跨阶段配置和用户确认结果。不得仅依赖对话记录或代码常量。
 
+阶段 1-7 正式运行必须传入上一阶段的 `0X_stage_manifest.json`。manifest 是唯一正式交接入口，声明主配置路径、配置快照、累计上游产物路径、pending 决策和下一阶段；下一阶段不得绕过 manifest 猜测或扫描上游文件。直接文件参数仅用于单元测试或显式 `--compatibility-mode`。
+
 ## 全局约束
 
 - 首先确认 Y_label 含义、模型类型、时间字段和样本唯一标识。
@@ -52,6 +54,7 @@ description: "Use when building or reviewing an application credit scorecard wor
 4. 优先复用对应 `scripts/0X_*.py`，根据项目字段和已确认配置调整。
 5. 生成核心输出、审计输出和展示输出。
 6. 执行 reference 中的验收规则并向用户确认结果。
+7. 保存本阶段配置快照、`0X-output-list.xlsx` 和 `0X_stage_manifest.json`；存在阻断性 pending 时 manifest 状态不得标记为完成。
 
 ## 脚本索引
 
@@ -65,3 +68,5 @@ description: "Use when building or reviewing an application credit scorecard wor
 | 5 | `scripts/05_model_evaluation.py` |
 | 6 | `scripts/06_scorecard.py` |
 | 7 | `scripts/07_final_report.py` |
+
+公共阶段契约由 `scripts/stage_contracts.py` 实现。

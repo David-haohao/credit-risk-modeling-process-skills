@@ -49,6 +49,14 @@ def apply_calibrator(calibrator: LogisticRegression, probabilities: np.ndarray) 
     return calibrator.predict_proba(_raw_logit(probabilities))[:, 1]
 
 
+def apply_odds_adjustment(probabilities: np.ndarray, train_bad_rate: float, actual_bad_rate: float) -> np.ndarray:
+    if not 0 < train_bad_rate < 1 or not 0 < actual_bad_rate < 1:
+        raise ValueError("Odds 修正坏账率必须位于 0 和 1 之间")
+    delta = np.log(actual_bad_rate / (1 - actual_bad_rate)) - np.log(train_bad_rate / (1 - train_bad_rate))
+    adjusted_logit = _raw_logit(probabilities).ravel() + delta
+    return 1 / (1 + np.exp(-adjusted_logit))
+
+
 def probability_to_score(
     p_bad: np.ndarray, base_score: float, base_odds: float, pdo: float, rate: float = 2,
     clip_min: Optional[float] = None, clip_max: Optional[float] = None,
@@ -140,6 +148,30 @@ def calibration_comparison(data: pd.DataFrame, calibrated: np.ndarray, dataset: 
     }
 
 
+def calibration_detail(data: pd.DataFrame, calibrated: np.ndarray, dataset: str, n_bins: int = 10) -> pd.DataFrame:
+    frame = data.copy()
+    frame["y_pred_calibrated"] = calibrated
+    frame["bin"] = pd.qcut(frame["y_pred_raw"], q=n_bins, labels=False, duplicates="drop")
+    detail = frame.groupby("bin", observed=False).agg(
+        count=("y_true", "size"), mean_pred_raw=("y_pred_raw", "mean"),
+        mean_pred_calibrated=("y_pred_calibrated", "mean"), actual_bad_rate=("y_true", "mean"),
+    ).reset_index()
+    detail.insert(0, "dataset", dataset)
+    return detail
+
+
+def save_reliability_plot(detail: pd.DataFrame, path: Path, dataset: str) -> None:
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(detail["mean_pred_raw"], detail["actual_bad_rate"], marker="o", label="Before")
+    ax.plot(detail["mean_pred_calibrated"], detail["actual_bad_rate"], marker="o", label="After")
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    ax.set_title(f"Reliability Before/After - {dataset}")
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def build_scoring_decisions() -> pd.DataFrame:
     return pd.DataFrame([{
         "decision_id": f"S{index:03d}", "decision_type": decision_type,
@@ -184,9 +216,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--previous-manifest")
     parser.add_argument("--compatibility-mode", action="store_true")
     parser.add_argument("--config")
-    parser.add_argument("--pred-train", required=True)
+    parser.add_argument("--pred-train")
     parser.add_argument("--pred-test")
-    parser.add_argument("--pred-oot", required=True)
+    parser.add_argument("--pred-oot")
+    parser.add_argument("--pred-grey", help="灰样本原始预测，包含 sample_id、time_col、y_pred_raw")
     parser.add_argument("--scoring-decisions")
     parser.add_argument("--binning-detail")
     parser.add_argument("--lr-coefficients")
@@ -201,8 +234,19 @@ def main() -> None:
     args = parse_args()
     require_formal_entry(args.previous_manifest, args.compatibility_mode, 6)
     manifest = load_previous_manifest(args.previous_manifest, 5) if args.previous_manifest else None
-    config_path = Path(args.config or (manifest or {}).get("config_snapshot", ""))
+    config_path = Path(args.config or (manifest or {}).get("config_path", ""))
     config = load_config(config_path) if config_path.exists() else {}
+    declared = (manifest or {}).get("outputs", {})
+    args.pred_train = args.pred_train or declared.get("04_pred_train")
+    args.pred_test = args.pred_test or declared.get("04_pred_test")
+    args.pred_oot = args.pred_oot or declared.get("04_pred_oot")
+    args.pred_grey = args.pred_grey or declared.get("04_pred_grey")
+    args.binning_detail = args.binning_detail or declared.get("03_binning_detail")
+    args.lr_coefficients = args.lr_coefficients or declared.get("04_lr_coefficients")
+    args.lr_woe_train = args.lr_woe_train or declared.get("03_train_woe")
+    args.lr_woe_oot = args.lr_woe_oot or declared.get("03_oot_woe")
+    if not args.pred_train or not args.pred_oot:
+        raise ValueError("阶段 6 manifest 缺少 Train/OOT 预测")
     if config.get("enable_stage6_scoring") is not True:
         raise ValueError("阶段 6 仅在 enable_stage6_scoring=true 时执行")
     output = Path(args.output_dir)
@@ -215,7 +259,7 @@ def main() -> None:
                           [output / "06_scoring_decisions.csv"], pending)
         write_stage_manifest(output, 6, "pending", config_path, {"previous_manifest": args.previous_manifest or ""},
                              {"scoring_decisions": output / "06_scoring_decisions.csv",
-                              "output_list": output / "06-output-list.xlsx"},
+                              "06_output_list": output / "06-output-list.xlsx"},
                              pending.to_dict("records"), 7)
         raise SystemExit("阶段 6 评分决策仍为 pending，请确认后重跑。")
 
@@ -227,6 +271,11 @@ def main() -> None:
         raise ValueError("grade_scheme confirmed_value 必须为 JSON 对象")
     clipping = parse_confirmed_value(decisions, "score_clipping")
     clipping = clipping if isinstance(clipping, dict) and clipping.get("enabled") else {}
+    calibration_method = str(parse_confirmed_value(decisions, "calibration_method")).lower()
+    if calibration_method != "platt":
+        raise ValueError("当前通用脚本仅执行已确认的 Platt 校准；其他方法不得静默替代")
+    odds_adjustment = parse_confirmed_value(decisions, "odds_adjustment")
+    odds_adjustment = odds_adjustment if isinstance(odds_adjustment, dict) and odds_adjustment.get("enabled") else {}
     model_type = config.get("model_type")
     datasets = {
         "Train": pd.read_csv(args.pred_train, sep=args.sep, encoding="utf-8-sig"),
@@ -238,7 +287,7 @@ def main() -> None:
         parse_confirmed_value(decisions, "lr_calibration")
     ).lower() in {"true", "calibrate", "platt"}
     calibrator = None
-    comparisons = []
+    comparisons, calibration_details = [], []
     if calibration_required:
         train = datasets["Train"]
         calibrator = fit_platt_calibrator(
@@ -250,8 +299,15 @@ def main() -> None:
     scored = {}
     for name, frame in datasets.items():
         final_prob = apply_calibrator(calibrator, frame["y_pred_raw"].to_numpy()) if calibrator else frame["y_pred_raw"].to_numpy()
+        if odds_adjustment:
+            final_prob = apply_odds_adjustment(
+                final_prob, odds_adjustment["train_bad_rate"], odds_adjustment["actual_bad_rate"],
+            )
         if calibrator:
             comparisons.append(calibration_comparison(frame, final_prob, name))
+            detail = calibration_detail(frame, final_prob, name)
+            calibration_details.append(detail)
+            save_reliability_plot(detail, output / f"06_reliability_before_after_{name.lower()}.png", name)
         score_raw, score = probability_to_score(
             final_prob, scoring["base_score"], scoring["base_odds"], scoring["pdo"],
             scoring.get("rate", 2), clipping.get("min"), clipping.get("max"),
@@ -261,7 +317,16 @@ def main() -> None:
         result["score_raw"], result["score"] = score_raw, score
         scored[name] = result
     labels_low_to_high = grade_scheme.get("labels_low_to_high", ["E", "D", "C", "B", "A"])
-    edges = fit_grade_edges(scored["Train"]["score"], len(labels_low_to_high))
+    grade_method = grade_scheme.get("method", "quantile")
+    if grade_method == "quantile":
+        edges = fit_grade_edges(scored["Train"]["score"], len(labels_low_to_high))
+    elif grade_method == "fixed":
+        confirmed_edges = grade_scheme.get("edges")
+        if not isinstance(confirmed_edges, list) or len(confirmed_edges) != len(labels_low_to_high) - 1:
+            raise ValueError("固定等级方案必须提供与标签数量匹配的 edges")
+        edges = [-np.inf, *sorted(confirmed_edges), np.inf]
+    else:
+        raise ValueError(f"不支持的已确认等级方案: {grade_method}")
     (output / "06_grade_edges.json").write_text(json.dumps(edges), encoding="utf-8")
     all_grade_stats = []
     for name, result in scored.items():
@@ -270,8 +335,33 @@ def main() -> None:
         all_grade_stats.append(grade_stats(result, name))
     pd.concat(all_grade_stats, ignore_index=True).to_csv(output / "06_grade_stats.csv", index=False, encoding="utf-8-sig")
     pd.DataFrame(comparisons).to_csv(output / "06_calibration_comparison.csv", index=False, encoding="utf-8-sig")
+    pd.concat(calibration_details, ignore_index=True).to_csv(
+        output / "06_calibration_detail.csv", index=False, encoding="utf-8-sig",
+    ) if calibration_details else pd.DataFrame().to_csv(output / "06_calibration_detail.csv", index=False)
+    grade_plot = pd.concat(all_grade_stats, ignore_index=True).pivot(
+        index="risk_grade", columns="dataset", values="sample_pct",
+    )
+    ax = grade_plot.plot(kind="bar", figsize=(7, 4))
+    ax.set_title("Risk Grade Distribution")
+    ax.figure.tight_layout()
+    ax.figure.savefig(output / "06_grade_distribution.png", dpi=150)
+    plt.close(ax.figure)
+    if declared.get("grey") and not args.pred_grey:
+        raise ValueError("存在灰样本，但 manifest 未提供可复用的灰样本原始预测；不得跳过灰样本评分")
+    if args.pred_grey:
+        grey = pd.read_csv(args.pred_grey, encoding="utf-8-sig")
+        final_prob = apply_calibrator(calibrator, grey["y_pred_raw"].to_numpy()) if calibrator else grey["y_pred_raw"].to_numpy()
+        raw, integer = probability_to_score(
+            final_prob, scoring["base_score"], scoring["base_odds"], scoring["pdo"],
+            scoring.get("rate", 2), clipping.get("min"), clipping.get("max"),
+        )
+        grey["y_pred_calibrated"] = final_prob if calibrator else np.nan
+        grey["score_raw"], grey["score"] = raw, integer
+        grey["risk_grade"] = apply_grade_edges(grey["score"], edges, labels_low_to_high)
+        grey.to_csv(output / "06_grey_scored.csv", index=False, encoding="utf-8-sig")
     parameters = {
         **scoring, "rounding_method": "ROUND_HALF_UP", "score_clipping": clipping or None,
+        "odds_adjustment": odds_adjustment or None, "grade_scheme": grade_scheme,
         "odds_definition": "bad/good", "score_direction": "higher_score_lower_risk",
     }
     (output / "06_scoring_parameters.json").write_text(json.dumps(parameters, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -303,7 +393,7 @@ def main() -> None:
     write_output_list(output / "06-output-list.xlsx", pd.DataFrame([{"status": "completed"}]), artifacts,
                       extra_sheets={"scoring_decisions": decisions})
     outputs = {path.stem: path for path in output.glob("06_*")}
-    outputs["output_list"] = output / "06-output-list.xlsx"
+    outputs["06_output_list"] = output / "06-output-list.xlsx"
     if manifest and manifest.get("outputs", {}).get("05_evaluation_decisions"):
         outputs["05_evaluation_decisions"] = manifest["outputs"]["05_evaluation_decisions"]
     write_stage_manifest(output, 6, "completed", config_path, {"previous_manifest": args.previous_manifest or ""},

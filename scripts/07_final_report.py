@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
-from stage_contracts import load_previous_manifest, require_formal_entry
+from stage_contracts import load_config, load_previous_manifest, require_formal_entry
 
 
 REQUIRED_PATTERNS = [
@@ -61,7 +61,7 @@ def build_inventory(artifact_dir: Path) -> pd.DataFrame:
 
 def build_inventory_from_manifest(manifest: dict) -> pd.DataFrame:
     rows = []
-    for path_text in manifest.get("outputs", {}).values():
+    for path_text in dict.fromkeys(manifest.get("outputs", {}).values()):
         path = Path(path_text)
         if not path.is_file() or path.name.startswith("07_"):
             continue
@@ -76,14 +76,14 @@ def read_stage6_scope(config_path: Path) -> Optional[bool]:
     """读取阶段 0 配置中的 enable_stage6_scoring。"""
     if not config_path.exists():
         return None
-    for line in config_path.read_text(encoding="utf-8-sig").splitlines():
-        key, separator, value = line.partition(":")
-        if separator and key.strip() == "enable_stage6_scoring":
-            normalized = value.split("#", 1)[0].strip().strip("'\"").lower()
-            if normalized in {"true", "yes", "1"}:
-                return True
-            if normalized in {"false", "no", "0"}:
-                return False
+    value = load_config(config_path).get("enable_stage6_scoring")
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "yes", "1"}:
+        return True
+    if normalized in {"false", "no", "0"}:
+        return False
     return None
 
 
@@ -270,7 +270,7 @@ def main() -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
 
     inventory = build_inventory_from_manifest(previous) if previous else build_inventory(artifact_dir)
-    config_path = Path(previous["config_snapshot"]) if previous else artifact_dir / "00_modeling_config.yaml"
+    config_path = Path(previous["config_path"]) if previous else artifact_dir / "00_modeling_config.yaml"
     stage6_enabled = read_stage6_scope(config_path)
     decision_paths = None
     if previous:

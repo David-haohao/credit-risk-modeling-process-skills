@@ -67,6 +67,7 @@ def build_bucket_table(
     grouped["cumulative_good_pct"] = grouped["good_cnt"].cumsum() / total_good
     grouped["cumulative_lift"] = grouped["cumulative_bad_pct"] / grouped["cumulative_sample_pct"]
     grouped["cumulative_ks"] = grouped["cumulative_bad_pct"] - grouped["cumulative_good_pct"]
+    grouped.insert(0, "weighted", bool(weight_col))
     grouped.insert(0, "scope", scope)
     grouped.insert(0, "dataset", dataset)
     return grouped
@@ -74,10 +75,14 @@ def build_bucket_table(
 
 def psi_detail(
     expected: pd.DataFrame, actual: pd.DataFrame, edges: list[float],
-    expected_name: str, actual_name: str,
+    expected_name: str, actual_name: str, weight_col: Optional[str] = None,
 ) -> tuple[pd.DataFrame, float]:
-    exp = pd.cut(expected["y_pred_raw"], edges, labels=False, include_lowest=True).value_counts(normalize=True)
-    act = pd.cut(actual["y_pred_raw"], edges, labels=False, include_lowest=True).value_counts(normalize=True)
+    def proportions(frame: pd.DataFrame) -> pd.Series:
+        bucket = pd.cut(frame["y_pred_raw"], edges, labels=False, include_lowest=True)
+        if weight_col and weight_col in frame:
+            return frame.assign(_bucket=bucket).groupby("_bucket", observed=False)[weight_col].sum() / frame[weight_col].sum()
+        return bucket.value_counts(normalize=True)
+    exp, act = proportions(expected), proportions(actual)
     buckets = range(len(edges) - 1)
     rows = []
     for bucket in buckets:
@@ -85,6 +90,7 @@ def psi_detail(
         actual_pct = max(float(act.get(bucket, 0)), 1e-6)
         contribution = (actual_pct - expected_pct) * np.log(actual_pct / expected_pct)
         rows.append({"expected": expected_name, "actual": actual_name, "bucket": bucket,
+                     "weighted": bool(weight_col),
                      "expected_pct": expected_pct, "actual_pct": actual_pct,
                      "psi_contribution": contribution})
     detail = pd.DataFrame(rows)
@@ -93,6 +99,7 @@ def psi_detail(
 
 def period_psi(
     train: pd.DataFrame, oot: pd.DataFrame, edges: list[float], time_col: str, granularity: str,
+    weight_col: Optional[str] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     period_codes = {"week": "W", "month": "M", "quarter": "Q"}
     if granularity not in period_codes:
@@ -102,10 +109,10 @@ def period_psi(
     frame["period"] = frame[time_col].dt.to_period(period_codes[granularity]).astype(str)
     details, summaries = [], []
     for period, group in frame.groupby("period"):
-        detail, psi = psi_detail(train, group, edges, "Train", period)
+        detail, psi = psi_detail(train, group, edges, "Train", period, weight_col)
         detail.insert(0, "period", period)
         details.append(detail)
-        summaries.append({"period": period, "sample_count": len(group),
+        summaries.append({"period": period, "sample_count": len(group), "weighted": bool(weight_col),
                           "bad_count": int(group["y_true"].sum()),
                           "bad_rate": group["y_true"].mean(), "psi": psi})
     return pd.concat(details, ignore_index=True), pd.DataFrame(summaries)
@@ -146,6 +153,7 @@ def calibration_metrics(
     ).reset_index()
     detail["mean_pred"] = detail["weighted_pred"] / detail["weight"]
     detail["actual_rate"] = detail["weighted_bad"] / detail["weight"]
+    detail.insert(0, "weighted", weight is not None)
     detail.insert(0, "dataset", dataset)
     return summary, detail
 
@@ -178,14 +186,62 @@ def _save_curve(table: pd.DataFrame, x: str, y: str, path: Path, title: str) -> 
     plt.close(fig)
 
 
+def save_roc_and_ks(data: pd.DataFrame, dataset: str, output: Path) -> None:
+    y, score = data["y_true"], data["y_pred_raw"]
+    fpr, tpr, _ = roc_curve(y, score)
+    auc = roc_auc_score(y, score)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(fpr, tpr, label=f"AUC={auc:.4f}")
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    ax.legend()
+    ax.set_title(f"ROC Curve - {dataset}")
+    fig.tight_layout()
+    fig.savefig(output / f"05_roc_curve_{dataset.lower()}.png", dpi=150)
+    plt.close(fig)
+    ordered = data.sort_values("y_pred_raw", ascending=False).reset_index(drop=True)
+    ordered["cum_bad"] = ordered["y_true"].cumsum() / ordered["y_true"].sum()
+    ordered["cum_good"] = (1 - ordered["y_true"]).cumsum() / (1 - ordered["y_true"]).sum()
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(ordered["cum_bad"], label="Bad")
+    ax.plot(ordered["cum_good"], label="Good")
+    ax.plot(ordered["cum_bad"] - ordered["cum_good"], label="KS")
+    ax.legend()
+    ax.set_title(f"KS Curve - {dataset}")
+    fig.tight_layout()
+    fig.savefig(output / f"05_ks_curve_{dataset.lower()}.png", dpi=150)
+    plt.close(fig)
+
+
+def save_bucket_lift(table: pd.DataFrame, path: Path, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.bar(table["bucket"].astype(str), table["lift"])
+    ax.axhline(1, linestyle="--", color="gray")
+    ax.set_title(title)
+    ax.set_xlabel("bucket")
+    ax.set_ylabel("lift")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
+def save_reliability(detail: pd.DataFrame, path: Path, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(detail["mean_pred"], detail["actual_rate"], marker="o")
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray")
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="阶段 5：模型评估")
     parser.add_argument("--previous-manifest")
     parser.add_argument("--compatibility-mode", action="store_true")
     parser.add_argument("--config")
-    parser.add_argument("--pred-train", required=True)
+    parser.add_argument("--pred-train")
     parser.add_argument("--pred-test")
-    parser.add_argument("--pred-oot", required=True)
+    parser.add_argument("--pred-oot")
     parser.add_argument("--evaluation-decisions")
     parser.add_argument("--rework-history")
     parser.add_argument("--time-col")
@@ -200,8 +256,14 @@ def main() -> None:
     args = parse_args()
     require_formal_entry(args.previous_manifest, args.compatibility_mode, 5)
     manifest = load_previous_manifest(args.previous_manifest, 4) if args.previous_manifest else None
-    config_path = Path(args.config or (manifest or {}).get("config_snapshot", ""))
+    config_path = Path(args.config or (manifest or {}).get("config_path", ""))
     config = load_config(config_path) if config_path.exists() else {}
+    declared = (manifest or {}).get("outputs", {})
+    args.pred_train = args.pred_train or declared.get("04_pred_train")
+    args.pred_test = args.pred_test or declared.get("04_pred_test")
+    args.pred_oot = args.pred_oot or declared.get("04_pred_oot")
+    if not args.pred_train or not args.pred_oot:
+        raise ValueError("阶段 5 manifest 缺少 Train/OOT 预测")
     time_col = config.get("fields", {}).get("time_col", args.time_col)
     granularity = config.get("psi_period_granularity")
     if granularity not in {"week", "month", "quarter"}:
@@ -220,14 +282,20 @@ def main() -> None:
     (output / "05_bucket_edges.json").write_text(json.dumps(edges), encoding="utf-8")
     metrics, internal, fixed, calibration_summaries, calibration_details = [], [], [], [], []
     for name, frame in datasets.items():
-        metrics.append(discrimination_metrics(frame, name, args.weight_col))
+        save_roc_and_ks(frame, name, output)
+        scopes = [None] + ([args.weight_col] if args.weight_col in frame.columns else [])
         internal_edges = fit_score_edges(frame["y_pred_raw"], args.n_buckets)
-        internal.append(build_bucket_table(frame, internal_edges, name, "internal", args.weight_col))
-        fixed_table = build_bucket_table(frame, edges, name, "fixed_train_edges", args.weight_col)
-        fixed.append(fixed_table)
-        cal_summary, cal_detail = calibration_metrics(frame, name, args.n_buckets, args.weight_col)
-        calibration_summaries.append(cal_summary)
-        calibration_details.append(cal_detail)
+        for scope_weight in scopes:
+            metrics.append(discrimination_metrics(frame, name, scope_weight))
+            internal.append(build_bucket_table(frame, internal_edges, name, "internal", scope_weight))
+            fixed.append(build_bucket_table(frame, edges, name, "fixed_train_edges", scope_weight))
+            cal_summary, cal_detail = calibration_metrics(frame, name, args.n_buckets, scope_weight)
+            calibration_summaries.append(cal_summary)
+            calibration_details.append(cal_detail)
+        fixed_table = fixed[-len(scopes)]
+        save_bucket_lift(fixed_table, output / f"05_lift_bucket_{name.lower()}.png", f"Bucket Lift - {name}")
+        save_reliability(calibration_details[-len(scopes)], output / f"05_reliability_{name.lower()}.png",
+                         f"Reliability - {name}")
         _save_curve(fixed_table, "cumulative_sample_pct", "cumulative_lift",
                     output / f"05_lift_cumulative_{name.lower()}.png", f"Cumulative Lift - {name}")
         _save_curve(fixed_table, "cumulative_sample_pct", "cumulative_bad_pct",
@@ -236,18 +304,53 @@ def main() -> None:
     pd.concat(internal, ignore_index=True).to_csv(output / "05_bucket_internal.csv", index=False, encoding="utf-8-sig")
     fixed_all = pd.concat(fixed, ignore_index=True)
     fixed_all.to_csv(output / "05_bucket_fixed.csv", index=False, encoding="utf-8-sig")
-    psi, psi_value = psi_detail(datasets["Train"], datasets["OOT"], edges, "Train", "OOT")
-    psi.to_csv(output / "05_score_psi_detail.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame([{"comparison": "Train_vs_OOT", "psi": psi_value}]).to_csv(
+    comparison = fixed_all.loc[fixed_all["weighted"].eq(False)]
+    fig, ax = plt.subplots(figsize=(8, 4))
+    for dataset, group in comparison.groupby("dataset"):
+        ax.plot(group["bucket"].astype(str), group["lift"], marker="o", label=dataset)
+    ax.legend()
+    ax.set_title("Train Fixed-Bin Lift Comparison")
+    fig.tight_layout()
+    fig.savefig(output / "05_lift_fixed_comparison.png", dpi=150)
+    plt.close(fig)
+    psi_details, psi_summaries, period_details, period_summaries = [], [], [], []
+    scopes = [None] + ([args.weight_col] if args.weight_col in datasets["Train"].columns and args.weight_col in datasets["OOT"].columns else [])
+    for scope_weight in scopes:
+        psi, psi_value = psi_detail(datasets["Train"], datasets["OOT"], edges, "Train", "OOT", scope_weight)
+        psi_details.append(psi)
+        psi_summaries.append({"comparison": "Train_vs_OOT", "psi": psi_value, "weighted": bool(scope_weight)})
+        period_detail, period_summary = period_psi(
+            datasets["Train"], datasets["OOT"], edges, time_col, granularity, scope_weight,
+        )
+        period_details.append(period_detail)
+        period_summaries.append(period_summary)
+    pd.concat(psi_details, ignore_index=True).to_csv(output / "05_score_psi_detail.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(psi_summaries).to_csv(
         output / "05_score_psi_summary.csv", index=False, encoding="utf-8-sig",
     )
-    period_detail, period_summary = period_psi(datasets["Train"], datasets["OOT"], edges, time_col, granularity)
+    period_detail = pd.concat(period_details, ignore_index=True)
+    period_summary = pd.concat(period_summaries, ignore_index=True)
     period_detail.to_csv(output / "05_period_psi_detail.csv", index=False, encoding="utf-8-sig")
     period_summary.to_csv(output / "05_period_psi_summary.csv", index=False, encoding="utf-8-sig")
     _save_curve(period_summary, "period", "psi", output / "05_period_psi_trend.png", "Period PSI")
     pd.DataFrame(calibration_summaries).to_csv(output / "05_calibration_summary.csv", index=False, encoding="utf-8-sig")
     pd.concat(calibration_details, ignore_index=True).to_csv(output / "05_calibration_detail.csv", index=False, encoding="utf-8-sig")
     decisions = pd.read_csv(args.evaluation_decisions, encoding="utf-8-sig") if args.evaluation_decisions else build_core_decisions()
+    if not args.evaluation_decisions:
+        evidence = {
+            "discrimination_and_dataset_gap": pd.DataFrame(metrics).to_json(orient="records", force_ascii=False),
+            "bucket_lift_and_cumulative_lift": fixed_all.groupby(["dataset", "weighted"]).agg(
+                max_ks=("cumulative_ks", "max"), max_cumulative_lift=("cumulative_lift", "max"),
+            ).reset_index().to_json(orient="records", force_ascii=False),
+            "overall_and_period_psi": json.dumps(
+                {"overall": psi_summaries, "period_max": float(period_summary["psi"].max())},
+                ensure_ascii=False,
+            ),
+            "brier_logloss_reliability_slope": pd.DataFrame(calibration_summaries).to_json(
+                orient="records", force_ascii=False,
+            ),
+        }
+        decisions["observed_value"] = decisions["metric_scope"].map(evidence)
     decisions.to_csv(output / "05_evaluation_decisions.csv", index=False, encoding="utf-8-sig")
     rework = pd.read_csv(args.rework_history, encoding="utf-8-sig") if args.rework_history else pd.DataFrame(
         columns=["iteration_id", "source_model_version", "issue_type", "evidence", "return_stage",
@@ -262,7 +365,7 @@ def main() -> None:
     write_output_list(output / "05-output-list.xlsx", summary, artifacts, pending,
                       {"evaluation_summary": pd.DataFrame(metrics), "evaluation_decisions": decisions})
     outputs = {path.stem: path for path in output.glob("05_*")}
-    outputs["output_list"] = output / "05-output-list.xlsx"
+    outputs["05_output_list"] = output / "05-output-list.xlsx"
     status = "pending" if not pending.empty else "completed"
     next_stage = 6 if config.get("enable_stage6_scoring") is True else 7
     write_stage_manifest(output, 5, status, config_path, {"previous_manifest": args.previous_manifest or ""},

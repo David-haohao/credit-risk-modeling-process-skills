@@ -11,6 +11,8 @@
 
 阶段 4 仅训练阶段 0 已确认的模型。OOT 只用于最终泛化评估，禁止参与变量筛选、调参、Early Stopping 或模型选择。
 
+正式运行必须读取 `03_stage_manifest.json`，并从 manifest 获取阶段 3 数据、最终特征列表和主配置路径。
+
 模型预测统一命名为 `y_pred_raw`。是否能够解释为真实坏账率，由阶段 5 校准评估决定。
 
 ---
@@ -175,6 +177,7 @@ Pruner、多目标优化、粗细两阶段搜索和扩展可视化属于按需�
 | `04_pred_oot.csv` | OOT 原始预测 |
 | `04_model_decisions.csv` | 人工确认记录 |
 | `04-output-list.xlsx` | 阶段汇总 |
+| `04_stage_manifest.json` | 阶段 4 正式交接清单 |
 
 XGB/LGB 额外输出 `04_pred_test.csv` 和调优子 reference 规定的核心审计文件。
 

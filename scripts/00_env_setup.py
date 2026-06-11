@@ -12,7 +12,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from stage_contracts import write_config, write_output_list, write_stage_manifest
+from stage_contracts import load_config, write_config, write_output_list, write_stage_manifest
 
 
 # =============================================================================
@@ -34,6 +34,7 @@ REQUIRED_PACKAGES: dict[str, str] = {
     "statsmodels": "0.12+",
     "yaml": "6.0+",
 }
+INSTALL_NAMES = {"yaml": "PyYAML", "sklearn": "scikit-learn"}
 
 
 def check_packages() -> bool:
@@ -46,7 +47,7 @@ def check_packages() -> bool:
             print(f"  [OK] {pkg} == {actual}")
         except ImportError:
             print(f"  [MISSING] {pkg} ({version})")
-            missing.append(pkg)
+            missing.append(INSTALL_NAMES.get(pkg, pkg))
 
     if missing:
         print(f"\n缺少以下包，请先安装：")
@@ -210,15 +211,35 @@ def main() -> None:
         for pkg, version in REQUIRED_PACKAGES.items()
     ])
     environment.to_csv(output / "00_environment_check.csv", index=False, encoding="utf-8-sig")
-    profile = pd.DataFrame([{"raw_data_path": str(Path(args.filepath).resolve()), "rows": n_rows,
-                             "columns": n_cols, "file_size_mb": file_size_mb}])
+    profile = pd.DataFrame([{
+        "raw_data_path": str(Path(args.filepath).resolve()), "rows": n_rows,
+        "columns": n_cols, "file_size_mb": file_size_mb, "column": column,
+        "dtype": str(df[column].dtype), "non_missing_count": int(df[column].notna().sum()),
+        "missing_count": int(df[column].isna().sum()), "unique": int(df[column].nunique(dropna=True)),
+    } for column in df.columns])
     profile.to_csv(output / "00_data_profile.csv", index=False, encoding="utf-8-sig")
+    config = load_config(config_path)
+    checks = {
+        "paths.raw_data_path": config.get("paths", {}).get("raw_data_path"),
+        "paths.code_dir": config.get("paths", {}).get("code_dir"),
+        "paths.intermediate_dir": config.get("paths", {}).get("intermediate_dir"),
+        "paths.report_dir": config.get("paths", {}).get("report_dir"),
+        "fields.target_col": config.get("fields", {}).get("target_col"),
+        "fields.time_col": config.get("fields", {}).get("time_col"),
+        "model_type": config.get("model_type"),
+        "enable_stage6_scoring": config.get("enable_stage6_scoring"),
+        "psi_period_granularity": config.get("psi_period_granularity"),
+        "sample_split.oot_method": config.get("sample_split", {}).get("oot_method"),
+    }
+    required_pending = [{"config_item": key, "decision": "pending"} for key, value in checks.items()
+                        if value in {None, "", "pending"}]
     outputs = {"config": config_path, "environment_check": output / "00_environment_check.csv",
                "data_profile": output / "00_data_profile.csv"}
-    summary = pd.DataFrame([{"status": "pending_confirmation", "raw_data_path": args.filepath}])
-    write_output_list(output / "00-output-list.xlsx", summary, list(outputs.values()), summary)
-    outputs["output_list"] = output / "00-output-list.xlsx"
-    write_stage_manifest(output, 0, "completed", config_path, {"raw_data": args.filepath}, outputs, [], 1)
+    status = "pending" if required_pending else "completed"
+    summary = pd.DataFrame([{"status": status, "raw_data_path": args.filepath}])
+    write_output_list(output / "00-output-list.xlsx", summary, list(outputs.values()), pd.DataFrame(required_pending))
+    outputs["00_output_list"] = output / "00-output-list.xlsx"
+    write_stage_manifest(output, 0, status, config_path, {"raw_data": args.filepath}, outputs, required_pending, 1)
 
 
 if __name__ == "__main__":

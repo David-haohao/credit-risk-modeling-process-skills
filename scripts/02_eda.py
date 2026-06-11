@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -17,6 +18,40 @@ from stage_contracts import load_config, load_previous_manifest, require_formal_
 # =============================================================================
 # 样本时间分布
 # =============================================================================
+
+
+def configured_quality_candidates(
+    data: pd.DataFrame, feature_cols: list[str], rules: dict,
+) -> list[dict]:
+    """仅执行配置中明确提供阈值或类型规则的质量检查。"""
+    rows = []
+    if "high_missing_rate" in rules:
+        threshold = float(rules["high_missing_rate"])
+        for feature in feature_cols:
+            rate = data[feature].isna().mean()
+            if rate > threshold:
+                rows.append({"feature": feature, "issue_type": "high_missing", "issue_metric": rate,
+                             "suggested_action": "drop_or_confirm"})
+    if "sparse_category_rate" in rules:
+        threshold = float(rules["sparse_category_rate"])
+        for feature in feature_cols:
+            if pd.api.types.is_numeric_dtype(data[feature]) and data[feature].nunique(dropna=True) > 20:
+                continue
+            sparse = data[feature].astype("string").fillna("__MISSING__").value_counts(normalize=True)
+            sparse = sparse[sparse < threshold]
+            if not sparse.empty:
+                rows.append({"feature": feature, "issue_type": "sparse_category",
+                             "issue_metric": json.dumps(sparse.to_dict(), ensure_ascii=False),
+                             "suggested_action": "merge_or_confirm"})
+    for feature, expected in rules.get("expected_types", {}).items():
+        if feature not in data:
+            continue
+        actual = "numeric" if pd.api.types.is_numeric_dtype(data[feature]) else "categorical"
+        if actual != expected:
+            rows.append({"feature": feature, "issue_type": "type_anomaly",
+                         "issue_metric": f"expected={expected},actual={actual}",
+                         "suggested_action": "transform_or_confirm"})
+    return rows
 
 def plot_time_distribution(
     data: pd.DataFrame, time_col: str, target_col: str, output_path: Optional[str] = None,
@@ -276,12 +311,12 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="阶段 2：EDA 数据探索性分析"
     )
-    parser.add_argument("--input", required=True, help="训练集 CSV 路径（阶段 1 输出）")
+    parser.add_argument("--input", help="兼容模式训练集 CSV 路径")
     parser.add_argument("--previous-manifest")
     parser.add_argument("--compatibility-mode", action="store_true")
     parser.add_argument("--config")
-    parser.add_argument("--target-col", required=True, help="Y_label 列名")
-    parser.add_argument("--time-col", required=True, help="时间列名")
+    parser.add_argument("--target-col", help="Y_label 列名")
+    parser.add_argument("--time-col", help="时间列名")
     parser.add_argument("--sample-id-col", default="sample_id", help="样本唯一标识列")
     parser.add_argument("--sample-weight-col", default="sample_weight", help="样本权重列")
     parser.add_argument("--output-dir", default="./output", help="输出目录")
@@ -295,12 +330,15 @@ def main() -> None:
     args = parse_args()
     require_formal_entry(args.previous_manifest, args.compatibility_mode, 2)
     manifest = load_previous_manifest(args.previous_manifest, 1) if args.previous_manifest else None
-    config_path = Path(args.config or (manifest or {}).get("config_snapshot", ""))
+    config_path = Path(args.config or (manifest or {}).get("config_path", ""))
     config = load_config(config_path) if config_path.exists() else {}
+    args.input = args.input or (manifest or {}).get("outputs", {}).get("train")
     fields = config.get("fields", {})
     args.target_col = fields.get("target_col", args.target_col)
     args.time_col = fields.get("time_col", args.time_col)
     args.sample_id_col = fields.get("sample_id_col") or args.sample_id_col
+    if not args.input or not args.target_col or not args.time_col:
+        raise ValueError("阶段 2 manifest/config 缺少 train、target_col 或 time_col")
 
     import os as _os
     _os.makedirs(args.output_dir, exist_ok=True)
@@ -381,6 +419,9 @@ def main() -> None:
         "confirmed_by": "",
         "confirmed_at": "",
     } for row in extreme)
+    quality_decisions.extend({
+        **row, "decision": "pending", "decision_detail": "", "confirmed_by": "", "confirmed_at": "",
+    } for row in configured_quality_candidates(df, feature_cols, config.get("eda_quality_thresholds", {})))
     pd.DataFrame(quality_decisions, columns=[
         "feature", "issue_type", "issue_metric", "suggested_action",
         "decision", "decision_detail", "confirmed_by", "confirmed_at",
@@ -392,8 +433,10 @@ def main() -> None:
     artifacts = list(output.glob("02_*"))
     write_output_list(output / "02-output-list.xlsx", summary, artifacts, decisions)
     outputs = {path.stem: path for path in output.glob("02_*")}
-    outputs["output_list"] = output / "02-output-list.xlsx"
-    pending = decisions.loc[decisions["decision"].eq("pending")].to_dict("records") if not decisions.empty else []
+    outputs["02_output_list"] = output / "02-output-list.xlsx"
+    pending = decisions.loc[
+        decisions["decision"].eq("pending") & decisions["issue_type"].eq("time_leakage")
+    ].to_dict("records") if not decisions.empty else []
     write_stage_manifest(output, 2, "completed", config_path, {"previous_manifest": args.previous_manifest or ""},
                          outputs, pending, 3)
 

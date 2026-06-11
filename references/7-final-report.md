@@ -14,6 +14,8 @@
 
 ### 必需输入
 
+正式运行只接受已完成的 `05_stage_manifest.json` 或 `06_stage_manifest.json`，并仅汇总 manifest 已声明的产物。
+
 | 输入 | 用途 |
 |------|------|
 | `00_modeling_config.yaml` | 项目背景、模型配置、路径及用户确认项 |
