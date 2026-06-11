@@ -1,338 +1,274 @@
 #!/usr/bin/env python3
-"""阶段 5：模型评估 —— KS/AUC/Gini、KS 曲线、ROC 曲线、KS_bucket、LIFT、PSI、校准度。"""
+"""阶段 5：评估冻结模型的 y_pred_raw，并生成审计与人工决策。"""
 
 from __future__ import annotations
 
 import argparse
-from typing import Any
+import json
+from pathlib import Path
+from typing import Optional
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import toad
-from sklearn.metrics import roc_auc_score, roc_curve
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score, roc_curve
+
+from stage_contracts import (
+    load_config, load_previous_manifest, require_formal_entry, write_output_list,
+    write_stage_manifest,
+)
 
 
-# =============================================================================
-# KS / AUC / Gini
-# =============================================================================
-
-def calc_ks_auc(
-    y_true: pd.Series, y_pred_proba: np.ndarray, dataset_name: str = "",
-) -> dict[str, float]:
-    """计算 KS 和 AUC。"""
-    ks = toad.metrics.KS(y_pred_proba, y_true)
-    auc = toad.metrics.AUC(y_pred_proba, y_true)
-    gini = 2 * auc - 1
-
-    print(f"[{dataset_name}] KS={ks:.4f}, AUC={auc:.4f}, Gini={gini:.4f}")
-    return {"ks": round(ks, 4), "auc": round(auc, 4), "gini": round(gini, 4)}
+def validate_prediction_frame(data: pd.DataFrame, time_col: Optional[str] = None) -> None:
+    required = {"sample_id", "y_true", "y_pred_raw"}
+    if time_col:
+        required.add(time_col)
+    missing = required - set(data.columns)
+    if missing:
+        raise ValueError(f"预测文件缺少字段: {sorted(missing)}")
 
 
-# =============================================================================
-# KS 曲线
-# =============================================================================
-
-def plot_ks_curve(
-    y_true: pd.Series, y_pred_proba: np.ndarray, dataset_name: str = "",
-    output_path: str | None = None,
-) -> None:
-    """绘制 KS 曲线。"""
-    df = pd.DataFrame({
-        "y": y_true.values if hasattr(y_true, "values") else y_true,
-        "score": y_pred_proba,
-    })
-    df = df.sort_values("score", ascending=False).reset_index(drop=True)
-    df["cum_good"] = (df["y"] == 0).cumsum() / (df["y"] == 0).sum()
-    df["cum_bad"] = (df["y"] == 1).cumsum() / (df["y"] == 1).sum()
-    df["ks_curve"] = df["cum_bad"] - df["cum_good"]
-    ks_val = df["ks_curve"].max()
-
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(df["cum_bad"], label="Bad", color="darkred", linewidth=1.5)
-    ax.plot(df["cum_good"], label="Good", color="steelblue", linewidth=1.5)
-    ax.plot(df["ks_curve"], label=f"KS Curve (max={ks_val:.4f})",
-            color="gray", linestyle="--", linewidth=1)
-    ax.set_title(f"KS Curve - {dataset_name} (KS={ks_val:.4f})", fontsize=13)
-    ax.set_xlabel("Score Rank (descending)")
-    ax.legend(fontsize=9)
-    plt.tight_layout()
-    if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.show()
-    plt.close()
+def fit_score_edges(scores: pd.Series, n_buckets: int = 10) -> list[float]:
+    _, edges = pd.qcut(scores, q=n_buckets, retbins=True, duplicates="drop")
+    edges = np.asarray(edges, dtype=float)
+    edges[0], edges[-1] = -np.inf, np.inf
+    return edges.tolist()
 
 
-# =============================================================================
-# ROC 曲线
-# =============================================================================
-
-def plot_roc_curve(
-    y_true: pd.Series, y_pred_proba: np.ndarray, dataset_name: str = "",
-    output_path: str | None = None,
-) -> None:
-    """绘制 ROC 曲线。"""
-    fpr, tpr, _ = roc_curve(y_true, y_pred_proba)
-    auc = roc_auc_score(y_true, y_pred_proba)
-
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(fpr, tpr, color="darkred", linewidth=1.5, label=f"AUC={auc:.4f}")
-    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=0.8)
-    ax.set_xlabel("False Positive Rate")
-    ax.set_ylabel("True Positive Rate")
-    ax.set_title(f"ROC Curve - {dataset_name}", fontsize=13)
-    ax.legend(fontsize=9)
-    plt.tight_layout()
-    if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.show()
-    plt.close()
+def _weighted_sum(values: pd.Series, weights: pd.Series) -> float:
+    return float(np.sum(values.to_numpy(dtype=float) * weights.to_numpy(dtype=float)))
 
 
-# =============================================================================
-# KS_bucket 分箱统计
-# =============================================================================
-
-def evaluate_ks_bucket(
-    y_true: pd.Series, y_pred_proba: np.ndarray, n_buckets: int = 10,
-    dataset_name: str = "",
+def build_bucket_table(
+    data: pd.DataFrame, edges: list[float], dataset: str, scope: str,
+    weight_col: Optional[str] = None,
 ) -> pd.DataFrame:
-    """按预测分数分桶，输出 bad_rate、累计好/坏占比、LIFT。"""
-    bucket_df = toad.metrics.KS_bucket(y_pred_proba, y_true, bucket=n_buckets)
-
-    print(f"\n=== KS Bucket - {dataset_name} ===")
-    print(bucket_df.to_string())
-
-    bad_rates = bucket_df["bad_rate"].values
-    is_mono = (
-        all(bad_rates[i] <= bad_rates[i + 1] for i in range(len(bad_rates) - 1))
-        or all(bad_rates[i] >= bad_rates[i + 1] for i in range(len(bad_rates) - 1))
-    )
-    print(f"Bad_rate 随桶序单调: {is_mono}")
-
-    return bucket_df
-
-
-# =============================================================================
-# LIFT 曲线
-# =============================================================================
-
-def plot_lift_curve(
-    y_true: pd.Series, y_pred_proba: np.ndarray, dataset_name: str = "",
-    output_path: str | None = None,
-) -> pd.DataFrame:
-    """绘制 LIFT 曲线。"""
-    df = pd.DataFrame({
-        "y": y_true.values if hasattr(y_true, "values") else y_true,
-        "score": y_pred_proba,
-    })
-    df["decile"] = pd.qcut(df["score"], q=10, labels=False, duplicates="drop")
-    baseline = df["y"].mean()
-
-    lift_df = df.groupby("decile")["y"].agg(["mean", "count"]).reset_index()
-    lift_df["lift"] = lift_df["mean"] / baseline
-    lift_df = lift_df.sort_values("decile")
-
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.bar(range(len(lift_df)), lift_df["lift"], color="darkred", alpha=0.85)
-    ax.axhline(y=1, color="gray", linestyle="--", linewidth=0.8, label="Baseline (LIFT=1)")
-    ax.set_xticks(range(len(lift_df)))
-    ax.set_xticklabels(lift_df["decile"] + 1)
-    ax.set_xlabel("Score Decile (1=Lowest)")
-    ax.set_ylabel("LIFT")
-    ax.set_title(f"LIFT Curve - {dataset_name}", fontsize=13)
-    ax.legend(fontsize=9)
-
-    for i, lift in enumerate(lift_df["lift"]):
-        ax.text(i, lift + 0.02, f"{lift:.2f}", ha="center", fontsize=8)
-
-    plt.tight_layout()
-    if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.show()
-    plt.close()
-
-    return lift_df
-
-
-# =============================================================================
-# 模型分数 PSI
-# =============================================================================
-
-def calc_model_psi(
-    y_train_pred: np.ndarray, y_oot_pred: np.ndarray, n_buckets: int = 10,
-) -> float:
-    """计算训练集与 OOT 的模型预测分数 PSI。"""
-    psi_val = toad.metrics.PSI(y_train_pred, y_oot_pred, bucket=n_buckets)
-    print(f"模型分数 PSI (Train vs OOT): {psi_val:.4f}")
-
-    if psi_val < 0.1:
-        print("  判定: 稳定")
-    elif psi_val < 0.25:
-        print("  判定: 轻微漂移，建议关注")
-    else:
-        print("  判定: 显著漂移，建议检查客群变化或特征稳定性")
-
-    return psi_val
-
-
-# =============================================================================
-# 特征 PSI
-# =============================================================================
-
-def calc_cross_sample_psi(
-    data_train: pd.DataFrame, data_oot: pd.DataFrame, final_cols: list[str],
-    combiner: Any,
-) -> pd.DataFrame:
-    """计算最终入模特征在训练集与 OOT 之间的 PSI。"""
-    psi_results = []
-    for col in final_cols:
-        if col not in data_train.columns or col not in data_oot.columns:
-            continue
-        psi_val = toad.metrics.PSI(data_train[col], data_oot[col], combiner=combiner)
-        psi_results.append({"column": col, "psi": round(psi_val, 4)})
-
-    psi_df = pd.DataFrame(psi_results).sort_values("psi", ascending=False)
-    print(f"特征 PSI (Train vs OOT) 前 10:")
-    print(psi_df.head(10).to_string(index=False))
-
-    high_psi = psi_df[psi_df["psi"] > 0.25]
-    if len(high_psi) > 0:
-        print(f"\n[WARN] 以下 {len(high_psi)} 个特征 PSI > 0.25:")
-        for _, row in high_psi.iterrows():
-            print(f"  {row['column']}: PSI={row['psi']:.4f}")
-
-    return psi_df
-
-
-# =============================================================================
-# 校准度曲线
-# =============================================================================
-
-def plot_reliability_curve(
-    y_true: pd.Series, y_pred_proba: np.ndarray, dataset_name: str = "",
-    n_bins: int = 10, output_path: str | None = None,
-) -> pd.DataFrame:
-    """绘制校准度曲线（reliability curve）。"""
-    df = pd.DataFrame({
-        "y": y_true.values if hasattr(y_true, "values") else y_true,
-        "prob": y_pred_proba,
-    })
-    df["bin"] = pd.qcut(df["prob"], q=n_bins, labels=False, duplicates="drop")
-    cal = df.groupby("bin", observed=False).agg(
-        mean_pred=("prob", "mean"),
-        actual_rate=("y", "mean"),
-        count=("y", "count"),
+    frame = data.copy()
+    frame["bucket"] = pd.cut(frame["y_pred_raw"], bins=edges, labels=False, include_lowest=True)
+    frame["weight"] = frame[weight_col] if weight_col and weight_col in frame else 1.0
+    frame["bad_weight"] = frame["weight"] * frame["y_true"]
+    frame["good_weight"] = frame["weight"] * (1 - frame["y_true"])
+    grouped = frame.groupby("bucket", observed=False).agg(
+        count=("y_true", "size"), sample_weight=("weight", "sum"),
+        bad_cnt=("bad_weight", "sum"), good_cnt=("good_weight", "sum"),
+        score_min=("y_pred_raw", "min"), score_max=("y_pred_raw", "max"),
     ).reset_index()
+    grouped = grouped.sort_values("bucket", ascending=False).reset_index(drop=True)
+    total_weight = grouped["sample_weight"].sum()
+    total_bad = grouped["bad_cnt"].sum()
+    total_good = grouped["good_cnt"].sum()
+    overall_bad_rate = total_bad / total_weight
+    grouped["sample_pct"] = grouped["sample_weight"] / total_weight
+    grouped["bad_rate"] = grouped["bad_cnt"] / grouped["sample_weight"]
+    grouped["lift"] = grouped["bad_rate"] / overall_bad_rate
+    grouped["cumulative_sample_pct"] = grouped["sample_weight"].cumsum() / total_weight
+    grouped["cumulative_bad_pct"] = grouped["bad_cnt"].cumsum() / total_bad
+    grouped["cumulative_good_pct"] = grouped["good_cnt"].cumsum() / total_good
+    grouped["cumulative_lift"] = grouped["cumulative_bad_pct"] / grouped["cumulative_sample_pct"]
+    grouped["cumulative_ks"] = grouped["cumulative_bad_pct"] - grouped["cumulative_good_pct"]
+    grouped.insert(0, "scope", scope)
+    grouped.insert(0, "dataset", dataset)
+    return grouped
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(cal["mean_pred"], cal["actual_rate"], marker="o", color="darkred",
-            linewidth=1.5, label="Model")
-    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", linewidth=0.8, label="Perfect")
-    ax.set_xlabel("Mean Predicted Probability")
-    ax.set_ylabel("Actual Bad Rate")
-    ax.set_title(f"Reliability Curve - {dataset_name}", fontsize=13)
-    ax.legend(fontsize=9)
-    plt.tight_layout()
-    if output_path:
-        plt.savefig(output_path, dpi=150, bbox_inches="tight")
-    plt.show()
-    plt.close()
 
-    return cal
-
-
-# =============================================================================
-# 综合评估汇总
-# =============================================================================
-
-def build_evaluation_summary(metrics_dict: dict[str, dict[str, float]]) -> pd.DataFrame:
-    """汇总各数据集评估指标。"""
+def psi_detail(
+    expected: pd.DataFrame, actual: pd.DataFrame, edges: list[float],
+    expected_name: str, actual_name: str,
+) -> tuple[pd.DataFrame, float]:
+    exp = pd.cut(expected["y_pred_raw"], edges, labels=False, include_lowest=True).value_counts(normalize=True)
+    act = pd.cut(actual["y_pred_raw"], edges, labels=False, include_lowest=True).value_counts(normalize=True)
+    buckets = range(len(edges) - 1)
     rows = []
-    for ds_name, metrics in metrics_dict.items():
+    for bucket in buckets:
+        expected_pct = max(float(exp.get(bucket, 0)), 1e-6)
+        actual_pct = max(float(act.get(bucket, 0)), 1e-6)
+        contribution = (actual_pct - expected_pct) * np.log(actual_pct / expected_pct)
+        rows.append({"expected": expected_name, "actual": actual_name, "bucket": bucket,
+                     "expected_pct": expected_pct, "actual_pct": actual_pct,
+                     "psi_contribution": contribution})
+    detail = pd.DataFrame(rows)
+    return detail, float(detail["psi_contribution"].sum())
+
+
+def period_psi(
+    train: pd.DataFrame, oot: pd.DataFrame, edges: list[float], time_col: str, granularity: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    period_codes = {"week": "W", "month": "M", "quarter": "Q"}
+    if granularity not in period_codes:
+        raise ValueError("psi_period_granularity 必须为 week/month/quarter")
+    frame = oot.copy()
+    frame[time_col] = pd.to_datetime(frame[time_col])
+    frame["period"] = frame[time_col].dt.to_period(period_codes[granularity]).astype(str)
+    details, summaries = [], []
+    for period, group in frame.groupby("period"):
+        detail, psi = psi_detail(train, group, edges, "Train", period)
+        detail.insert(0, "period", period)
+        details.append(detail)
+        summaries.append({"period": period, "sample_count": len(group),
+                          "bad_count": int(group["y_true"].sum()),
+                          "bad_rate": group["y_true"].mean(), "psi": psi})
+    return pd.concat(details, ignore_index=True), pd.DataFrame(summaries)
+
+
+def discrimination_metrics(data: pd.DataFrame, dataset: str, weight_col: Optional[str] = None) -> dict:
+    weight = data[weight_col] if weight_col and weight_col in data else None
+    auc = roc_auc_score(data["y_true"], data["y_pred_raw"], sample_weight=weight)
+    fpr, tpr, _ = roc_curve(data["y_true"], data["y_pred_raw"], sample_weight=weight)
+    return {"dataset": dataset, "auc": auc, "ks": float(np.max(tpr - fpr)), "gini": 2 * auc - 1,
+            "weighted": weight is not None}
+
+
+def calibration_metrics(
+    data: pd.DataFrame, dataset: str, n_bins: int = 10, weight_col: Optional[str] = None,
+) -> tuple[dict, pd.DataFrame]:
+    weight = data[weight_col] if weight_col and weight_col in data else None
+    prob = np.clip(data["y_pred_raw"].to_numpy(dtype=float), 1e-10, 1 - 1e-10)
+    raw_logit = np.log(prob / (1 - prob)).reshape(-1, 1)
+    calibrator = LogisticRegression(penalty=None, solver="lbfgs", max_iter=1000)
+    calibrator.fit(raw_logit, data["y_true"], sample_weight=weight)
+    summary = {
+        "dataset": dataset,
+        "brier": brier_score_loss(data["y_true"], prob, sample_weight=weight),
+        "log_loss": log_loss(data["y_true"], prob, sample_weight=weight),
+        "calibration_intercept": float(calibrator.intercept_[0]),
+        "calibration_slope": float(calibrator.coef_[0][0]),
+        "weighted": weight is not None,
+    }
+    frame = data.copy()
+    frame["bin"] = pd.qcut(frame["y_pred_raw"], q=n_bins, labels=False, duplicates="drop")
+    frame["weight"] = frame[weight_col] if weight_col and weight_col in frame else 1.0
+    frame["weighted_pred"] = frame["weight"] * frame["y_pred_raw"]
+    frame["weighted_bad"] = frame["weight"] * frame["y_true"]
+    detail = frame.groupby("bin", observed=False).agg(
+        count=("y_true", "size"), weight=("weight", "sum"),
+        weighted_pred=("weighted_pred", "sum"), weighted_bad=("weighted_bad", "sum"),
+    ).reset_index()
+    detail["mean_pred"] = detail["weighted_pred"] / detail["weight"]
+    detail["actual_rate"] = detail["weighted_bad"] / detail["weight"]
+    detail.insert(0, "dataset", dataset)
+    return summary, detail
+
+
+def build_core_decisions() -> pd.DataFrame:
+    rows = []
+    for index, (issue_type, scope) in enumerate([
+        ("overfitting", "discrimination_and_dataset_gap"),
+        ("ranking_issue", "bucket_lift_and_cumulative_lift"),
+        ("data_shift", "overall_and_period_psi"),
+        ("poor_calibration", "brier_logloss_reliability_slope"),
+    ], start=1):
         rows.append({
-            "dataset": ds_name,
-            "KS": metrics.get("ks"),
-            "AUC": metrics.get("auc"),
-            "Gini": metrics.get("gini"),
+            "decision_id": f"D{index:03d}", "issue_type": issue_type, "metric_scope": scope,
+            "observed_value": "", "reference_value": "", "assessment": "",
+            "recommended_action": "", "return_stage": "", "decision": "pending",
+            "confirmed_by": "", "confirmed_at": "", "reason": "",
         })
-
-    summary_df = pd.DataFrame(rows)
-    print("\n========== 模型评估汇总 ==========")
-    print(summary_df.to_string(index=False))
-
-    if len(summary_df) >= 2:
-        train_ks = summary_df[summary_df["dataset"].str.contains("Train|train", na=False)]["KS"].values
-        oot_ks = summary_df[summary_df["dataset"].str.contains("OOT|oot", na=False)]["KS"].values
-        if len(train_ks) > 0 and len(oot_ks) > 0:
-            ks_drop = train_ks[0] - oot_ks[0]
-            print(f"\nKS 衰减 (Train → OOT): {ks_drop:.4f}")
-            if ks_drop > 0.05:
-                print("[WARN] KS 衰减 > 0.05，模型泛化能力需关注")
-
-    return summary_df
+    return pd.DataFrame(rows)
 
 
-# =============================================================================
-# CLI
-# =============================================================================
+def _save_curve(table: pd.DataFrame, x: str, y: str, path: Path, title: str) -> None:
+    fig, ax = plt.subplots(figsize=(7, 4))
+    ax.plot(table[x], table[y], marker="o")
+    ax.set_title(title)
+    ax.set_xlabel(x)
+    ax.set_ylabel(y)
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="阶段 5：模型评估"
-    )
-    parser.add_argument("--pred-train", required=True, help="训练集预测结果 CSV（含 y_true, y_pred）")
-    parser.add_argument("--pred-test", help="测试集预测结果 CSV")
-    parser.add_argument("--pred-oot", help="OOT 预测结果 CSV")
-    parser.add_argument("--output-dir", default="./output", help="输出目录")
-    parser.add_argument("--n-buckets", type=int, default=10, help="PSI/KS_bucket 分桶数")
-    parser.add_argument("--sep", default=",", help="CSV 分隔符")
+    parser = argparse.ArgumentParser(description="阶段 5：模型评估")
+    parser.add_argument("--previous-manifest")
+    parser.add_argument("--compatibility-mode", action="store_true")
+    parser.add_argument("--config")
+    parser.add_argument("--pred-train", required=True)
+    parser.add_argument("--pred-test")
+    parser.add_argument("--pred-oot", required=True)
+    parser.add_argument("--evaluation-decisions")
+    parser.add_argument("--rework-history")
+    parser.add_argument("--time-col")
+    parser.add_argument("--weight-col", default="sample_weight")
+    parser.add_argument("--n-buckets", type=int, default=10)
+    parser.add_argument("--output-dir", default="./output")
+    parser.add_argument("--sep", default=",")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    import os as _os
-    _os.makedirs(args.output_dir, exist_ok=True)
-
-    metrics_dict = {}
-
-    # 训练集
-    pred_train = pd.read_csv(args.pred_train, sep=args.sep, encoding="utf-8-sig")
-    y_train, s_train = pred_train["y_true"], pred_train["y_pred"].values
-    metrics_dict["Train"] = calc_ks_auc(y_train, s_train, "Train")
-    plot_ks_curve(y_train, s_train, "Train", f"{args.output_dir}/05_ks_curve_train.png")
-    plot_roc_curve(y_train, s_train, "Train", f"{args.output_dir}/05_roc_curve_train.png")
-    bucket_train = evaluate_ks_bucket(y_train, s_train, args.n_buckets, "Train")
-    bucket_train.to_csv(f"{args.output_dir}/05_ks_bucket_train.csv", index=False, encoding="utf-8-sig")
-    plot_lift_curve(y_train, s_train, "Train", f"{args.output_dir}/05_lift_curve_train.png")
-    plot_reliability_curve(y_train, s_train, "Train", output_path=f"{args.output_dir}/05_reliability_train.png")
-
-    # 测试集
+    require_formal_entry(args.previous_manifest, args.compatibility_mode, 5)
+    manifest = load_previous_manifest(args.previous_manifest, 4) if args.previous_manifest else None
+    config_path = Path(args.config or (manifest or {}).get("config_snapshot", ""))
+    config = load_config(config_path) if config_path.exists() else {}
+    time_col = config.get("fields", {}).get("time_col", args.time_col)
+    granularity = config.get("psi_period_granularity")
+    if granularity not in {"week", "month", "quarter"}:
+        raise ValueError("阶段 5 必须从配置读取已确认的 psi_period_granularity")
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    datasets = {
+        "Train": pd.read_csv(args.pred_train, sep=args.sep, encoding="utf-8-sig"),
+        "OOT": pd.read_csv(args.pred_oot, sep=args.sep, encoding="utf-8-sig"),
+    }
     if args.pred_test:
-        pred_test = pd.read_csv(args.pred_test, sep=args.sep, encoding="utf-8-sig")
-        y_test, s_test = pred_test["y_true"], pred_test["y_pred"].values
-        metrics_dict["Test"] = calc_ks_auc(y_test, s_test, "Test")
-        plot_ks_curve(y_test, s_test, "Test", f"{args.output_dir}/05_ks_curve_test.png")
-        plot_roc_curve(y_test, s_test, "Test", f"{args.output_dir}/05_roc_curve_test.png")
-
-    # OOT
-    if args.pred_oot:
-        pred_oot = pd.read_csv(args.pred_oot, sep=args.sep, encoding="utf-8-sig")
-        y_oot, s_oot = pred_oot["y_true"], pred_oot["y_pred"].values
-        metrics_dict["OOT"] = calc_ks_auc(y_oot, s_oot, "OOT")
-        plot_ks_curve(y_oot, s_oot, "OOT", f"{args.output_dir}/05_ks_curve_oot.png")
-        plot_roc_curve(y_oot, s_oot, "OOT", f"{args.output_dir}/05_roc_curve_oot.png")
-
-        psi_val = calc_model_psi(s_train, s_oot, args.n_buckets)
-        with open(f"{args.output_dir}/05_psi.txt", "w") as f:
-            f.write(f"model_psi: {psi_val:.4f}\n")
-
-    # 综合汇总
-    summary = build_evaluation_summary(metrics_dict)
-    summary.to_csv(f"{args.output_dir}/05_evaluation_summary.csv", index=False, encoding="utf-8-sig")
-
-    print(f"\n评估完成。输出已保存至: {args.output_dir}")
+        datasets["Test"] = pd.read_csv(args.pred_test, sep=args.sep, encoding="utf-8-sig")
+    for frame in datasets.values():
+        validate_prediction_frame(frame, time_col)
+    edges = fit_score_edges(datasets["Train"]["y_pred_raw"], args.n_buckets)
+    (output / "05_bucket_edges.json").write_text(json.dumps(edges), encoding="utf-8")
+    metrics, internal, fixed, calibration_summaries, calibration_details = [], [], [], [], []
+    for name, frame in datasets.items():
+        metrics.append(discrimination_metrics(frame, name, args.weight_col))
+        internal_edges = fit_score_edges(frame["y_pred_raw"], args.n_buckets)
+        internal.append(build_bucket_table(frame, internal_edges, name, "internal", args.weight_col))
+        fixed_table = build_bucket_table(frame, edges, name, "fixed_train_edges", args.weight_col)
+        fixed.append(fixed_table)
+        cal_summary, cal_detail = calibration_metrics(frame, name, args.n_buckets, args.weight_col)
+        calibration_summaries.append(cal_summary)
+        calibration_details.append(cal_detail)
+        _save_curve(fixed_table, "cumulative_sample_pct", "cumulative_lift",
+                    output / f"05_lift_cumulative_{name.lower()}.png", f"Cumulative Lift - {name}")
+        _save_curve(fixed_table, "cumulative_sample_pct", "cumulative_bad_pct",
+                    output / f"05_gains_{name.lower()}.png", f"Gains - {name}")
+    pd.DataFrame(metrics).to_csv(output / "05_evaluation_summary.csv", index=False, encoding="utf-8-sig")
+    pd.concat(internal, ignore_index=True).to_csv(output / "05_bucket_internal.csv", index=False, encoding="utf-8-sig")
+    fixed_all = pd.concat(fixed, ignore_index=True)
+    fixed_all.to_csv(output / "05_bucket_fixed.csv", index=False, encoding="utf-8-sig")
+    psi, psi_value = psi_detail(datasets["Train"], datasets["OOT"], edges, "Train", "OOT")
+    psi.to_csv(output / "05_score_psi_detail.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame([{"comparison": "Train_vs_OOT", "psi": psi_value}]).to_csv(
+        output / "05_score_psi_summary.csv", index=False, encoding="utf-8-sig",
+    )
+    period_detail, period_summary = period_psi(datasets["Train"], datasets["OOT"], edges, time_col, granularity)
+    period_detail.to_csv(output / "05_period_psi_detail.csv", index=False, encoding="utf-8-sig")
+    period_summary.to_csv(output / "05_period_psi_summary.csv", index=False, encoding="utf-8-sig")
+    _save_curve(period_summary, "period", "psi", output / "05_period_psi_trend.png", "Period PSI")
+    pd.DataFrame(calibration_summaries).to_csv(output / "05_calibration_summary.csv", index=False, encoding="utf-8-sig")
+    pd.concat(calibration_details, ignore_index=True).to_csv(output / "05_calibration_detail.csv", index=False, encoding="utf-8-sig")
+    decisions = pd.read_csv(args.evaluation_decisions, encoding="utf-8-sig") if args.evaluation_decisions else build_core_decisions()
+    decisions.to_csv(output / "05_evaluation_decisions.csv", index=False, encoding="utf-8-sig")
+    rework = pd.read_csv(args.rework_history, encoding="utf-8-sig") if args.rework_history else pd.DataFrame(
+        columns=["iteration_id", "source_model_version", "issue_type", "evidence", "return_stage",
+                 "action_taken", "new_model_version", "oot_usage_status", "reevaluation_result",
+                 "confirmed_by", "confirmed_at"]
+    )
+    rework.to_csv(output / "05_rework_history.csv", index=False, encoding="utf-8-sig")
+    pending = decisions.loc[decisions["decision"].eq("pending")]
+    summary = pd.DataFrame([{"status": "pending" if not pending.empty else "completed",
+                             "datasets": ",".join(datasets), "period_granularity": granularity}])
+    artifacts = list(output.glob("05_*"))
+    write_output_list(output / "05-output-list.xlsx", summary, artifacts, pending,
+                      {"evaluation_summary": pd.DataFrame(metrics), "evaluation_decisions": decisions})
+    outputs = {path.stem: path for path in output.glob("05_*")}
+    outputs["output_list"] = output / "05-output-list.xlsx"
+    status = "pending" if not pending.empty else "completed"
+    next_stage = 6 if config.get("enable_stage6_scoring") is True else 7
+    write_stage_manifest(output, 5, status, config_path, {"previous_manifest": args.previous_manifest or ""},
+                         outputs, pending.to_dict("records"), next_stage)
+    if not pending.empty:
+        raise SystemExit("阶段 5 核心决策仍为 pending，请确认后重跑。")
 
 
 if __name__ == "__main__":

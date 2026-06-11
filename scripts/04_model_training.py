@@ -17,10 +17,15 @@ import pandas as pd
 import sklearn
 import statsmodels.api as sm
 import xgboost as xgb
+try:
+    import lightgbm as lgb
+except ImportError:
+    lgb = None
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, roc_curve
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from statsmodels.stats.outliers_influence import variance_inflation_factor
+from stage_contracts import load_config, load_previous_manifest, require_formal_entry, write_stage_manifest
 
 
 DECISION_COLUMNS = [
@@ -42,6 +47,12 @@ XGB_SEARCH_SPACE = {
 
 def load_feature_list(path: str) -> list[str]:
     return [line.strip() for line in Path(path).read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def require_lightgbm() -> Any:
+    if lgb is None:
+        raise ImportError("LightGBM 路径需要安装 lightgbm，禁止伪装为 XGBoost")
+    return lgb
 
 
 def validate_feature_contract(
@@ -249,13 +260,15 @@ def build_final_lr_coefficients(model: LogisticRegression, features: list[str]) 
 
 def prediction_frame(
     model: Any, data: pd.DataFrame, features: list[str], target_col: str,
-    sample_id_col: str, weight_col: Optional[str],
+    sample_id_col: str, weight_col: Optional[str], time_col: Optional[str] = None,
 ) -> pd.DataFrame:
-    result = pd.DataFrame({
-        sample_id_col: data[sample_id_col].values,
-        "y_true": data[target_col].values,
-        "y_pred_raw": model.predict_proba(data[features])[:, 1],
-    })
+    result = pd.DataFrame({sample_id_col: data[sample_id_col].values})
+    if time_col:
+        if time_col not in data.columns:
+            raise ValueError(f"预测数据缺少时间字段: {time_col}")
+        result[time_col] = data[time_col].values
+    result["y_true"] = data[target_col].values
+    result["y_pred_raw"] = model.predict_proba(data[features])[:, 1]
     if weight_col and weight_col in data.columns:
         result[weight_col] = data[weight_col].values
     return result
@@ -331,7 +344,72 @@ def train_xgb_optuna(
     return model, study, trials
 
 
+def train_lgb_optuna(
+    X_train: pd.DataFrame, y_train: pd.Series, X_test: pd.DataFrame, y_test: pd.Series,
+    n_trials: int, scale_pos_weight: float, early_stopping_rounds: int, random_state: int,
+    optuna_sample_size: Optional[int] = None, sample_weight_train: Optional[pd.Series] = None,
+    sample_weight_test: Optional[pd.Series] = None,
+) -> tuple[Any, optuna.Study, pd.DataFrame]:
+    library = require_lightgbm()
+    if optuna_sample_size and optuna_sample_size < len(X_train):
+        X_opt = X_train.sample(n=optuna_sample_size, random_state=random_state)
+        y_opt = y_train.loc[X_opt.index]
+        weight_opt = sample_weight_train.loc[X_opt.index] if sample_weight_train is not None else None
+    else:
+        X_opt, y_opt, weight_opt = X_train, y_train, sample_weight_train
+
+    def objective(trial: optuna.Trial) -> float:
+        max_depth = trial.suggest_int("max_depth", 3, 12)
+        params = {
+            "num_leaves": trial.suggest_int("num_leaves", 8, min(128, 2 ** max_depth)),
+            "max_depth": max_depth,
+            "min_child_samples": trial.suggest_int("min_child_samples", 5, 100),
+            "learning_rate": trial.suggest_float("learning_rate", 0.005, 0.2, log=True),
+            "n_estimators": trial.suggest_int("n_estimators", 50, 1000),
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 1.0),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-4, 100, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 1e-4, 100, log=True),
+            "scale_pos_weight": scale_pos_weight, "random_state": random_state,
+            "verbosity": -1,
+        }
+        model = library.LGBMClassifier(**params)
+        model.fit(
+            X_opt, y_opt, sample_weight=weight_opt,
+            eval_set=[(X_test, y_test)], eval_sample_weight=[sample_weight_test],
+            callbacks=[library.early_stopping(early_stopping_rounds, verbose=False)],
+        )
+        train_auc = roc_auc_score(y_opt, model.predict_proba(X_opt)[:, 1])
+        test_pred = model.predict_proba(X_test)[:, 1]
+        test_auc = roc_auc_score(y_test, test_pred)
+        trial.set_user_attr("train_auc", train_auc)
+        trial.set_user_attr("test_auc", test_auc)
+        trial.set_user_attr("test_ks", calculate_ks(y_test, test_pred))
+        trial.set_user_attr("auc_gap", train_auc - test_auc)
+        trial.set_user_attr("best_iteration", model.best_iteration_)
+        return test_auc
+
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=random_state))
+    study.optimize(objective, n_trials=n_trials)
+    trials = study.trials_dataframe()
+    trials["historical_best_auc"] = trials["value"].cummax()
+    trials["improvement_vs_previous_best"] = trials["historical_best_auc"].diff()
+    best = study.best_params | {"scale_pos_weight": scale_pos_weight, "random_state": random_state, "verbosity": -1}
+    best_iteration = study.best_trial.user_attrs.get("best_iteration")
+    if best_iteration:
+        best["n_estimators"] = int(best_iteration)
+    model = library.LGBMClassifier(**best)
+    model.fit(X_train, y_train, sample_weight=sample_weight_train)
+    return model, study, trials
+
+
 def report_feature_importance(model: xgb.XGBClassifier, features: list[str]) -> pd.DataFrame:
+    if lgb is not None and isinstance(model, lgb.LGBMClassifier):
+        return pd.DataFrame({
+            "feature": features,
+            "weight": model.booster_.feature_importance(importance_type="split"),
+            "gain": model.booster_.feature_importance(importance_type="gain"),
+        }).sort_values("gain", ascending=False)
     booster = model.get_booster()
     weight = booster.get_score(importance_type="weight")
     gain = booster.get_score(importance_type="gain")
@@ -378,6 +456,9 @@ def save_model(model: Any, path: str) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="阶段 4：可审计模型训练")
     parser.add_argument("--model-type", choices=["LR", "XGB", "LGB"], required=True)
+    parser.add_argument("--previous-manifest")
+    parser.add_argument("--compatibility-mode", action="store_true")
+    parser.add_argument("--config")
     parser.add_argument("--train", required=True)
     parser.add_argument("--test")
     parser.add_argument("--oot", required=True)
@@ -385,6 +466,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-col", required=True)
     parser.add_argument("--sample-id-col", default="sample_id")
     parser.add_argument("--weight-col", default="sample_weight")
+    parser.add_argument("--time-col", help="保留到预测文件中的时间字段")
     parser.add_argument("--iv-table")
     parser.add_argument("--model-decisions")
     parser.add_argument("--output-dir", default="./output")
@@ -405,10 +487,22 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    require_formal_entry(args.previous_manifest, args.compatibility_mode, 4)
+    manifest = load_previous_manifest(args.previous_manifest, 3) if args.previous_manifest else None
+    config_path = Path(args.config or (manifest or {}).get("config_snapshot", ""))
+    config = load_config(config_path) if config_path.exists() else {}
+    fields = config.get("fields", {})
+    training = config.get("training", {})
+    args.model_type = config.get("model_type", args.model_type)
+    args.target_col = fields.get("target_col", args.target_col)
+    args.sample_id_col = fields.get("sample_id_col") or args.sample_id_col
+    args.weight_col = fields.get("sample_weight_col", args.weight_col)
+    args.time_col = fields.get("time_col", args.time_col)
+    args.n_trials = int(training.get("n_trials", args.n_trials))
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
     if args.model_type == "LGB":
-        raise NotImplementedError("当前环境未安装 LightGBM，禁止将 LGB 路径伪装为 XGB")
+        require_lightgbm()
     if args.model_type == "XGB" and not args.test:
         raise ValueError("XGB 路径必须提供 --test")
 
@@ -489,7 +583,8 @@ def main() -> None:
         imbalance_ratio = n_good / n_bad
         if scale is None:
             scale = 1.0
-        model, study, trials = train_xgb_optuna(
+        trainer = train_lgb_optuna if args.model_type == "LGB" else train_xgb_optuna
+        model, study, trials = trainer(
             train[features], train[args.target_col], test[features], test[args.target_col],
             args.n_trials, scale, args.early_stopping_rounds, args.random_state, args.optuna_sample_size,
             train[args.weight_col] if args.weight_col in train.columns else None,
@@ -545,6 +640,7 @@ def main() -> None:
     for name, data in datasets.items():
         prediction_frame(
             model, data, selected, args.target_col, args.sample_id_col, args.weight_col,
+            args.time_col,
         ).to_csv(output / f"04_pred_{name}.csv", index=False, encoding="utf-8-sig")
     inventory = pd.DataFrame({
         "file": sorted(path.name for path in output.iterdir() if path.is_file()),
@@ -569,6 +665,10 @@ def main() -> None:
             "parameter_importance": param_importance,
         })
     save_excel(str(output / "04-output-list.xlsx"), workbook_sheets)
+    outputs = {path.stem: path for path in output.glob("04_*")}
+    outputs["output_list"] = output / "04-output-list.xlsx"
+    write_stage_manifest(output, 4, "completed", config_path,
+                         {"previous_manifest": args.previous_manifest or ""}, outputs, [], 5)
     print(f"阶段 4 完成，最终特征数: {len(selected)}")
 
 
