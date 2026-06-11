@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 import pandas as pd
+from stage_contracts import load_previous_manifest, require_formal_entry
 
 
 REQUIRED_PATTERNS = [
@@ -58,6 +59,19 @@ def build_inventory(artifact_dir: Path) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=INVENTORY_COLUMNS)
 
 
+def build_inventory_from_manifest(manifest: dict) -> pd.DataFrame:
+    rows = []
+    for path_text in manifest.get("outputs", {}).values():
+        path = Path(path_text)
+        if not path.is_file() or path.name.startswith("07_"):
+            continue
+        rows.append({
+            "artifact": path.name, "relative_path": path.name, "suffix": path.suffix.lower(),
+            "size_bytes": path.stat().st_size, "included_in_report": path.suffix.lower() in {".png", ".html"},
+        })
+    return pd.DataFrame(rows, columns=INVENTORY_COLUMNS)
+
+
 def read_stage6_scope(config_path: Path) -> Optional[bool]:
     """读取阶段 0 配置中的 enable_stage6_scoring。"""
     if not config_path.exists():
@@ -75,6 +89,7 @@ def read_stage6_scope(config_path: Path) -> Optional[bool]:
 
 def read_confirmed_decisions(
     artifact_dir: Path, stage6_enabled: Optional[bool],
+    decision_paths: Optional[dict[str, Path]] = None,
 ) -> tuple[list[tuple[str, pd.DataFrame]], list[dict]]:
     """读取上游已确认决策，不从模型指标推断结论。"""
     confirmed = []
@@ -82,7 +97,7 @@ def read_confirmed_decisions(
     stages = ["05"] + (["06"] if stage6_enabled is True else [])
     for stage in stages:
         filename = DECISION_FILES[stage]
-        paths = list(artifact_dir.rglob(filename))
+        paths = [decision_paths[stage]] if decision_paths and stage in decision_paths else list(artifact_dir.rglob(filename))
         if not paths:
             continue
         if len(paths) > 1:
@@ -237,20 +252,34 @@ def render_html(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="阶段 7：最终报告汇总与交付")
-    parser.add_argument("--artifact-dir", required=True, help="阶段 0-6 过程文件目录")
+    parser.add_argument("--previous-manifest", help="阶段 5 或 6 正式交接 manifest")
+    parser.add_argument("--compatibility-mode", action="store_true")
+    parser.add_argument("--artifact-dir", help="兼容模式下的阶段 0-6 过程文件目录")
     parser.add_argument("--report-dir", required=True, help="阶段 0 确认的最终报告目录")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    artifact_dir = Path(args.artifact_dir)
+    require_formal_entry(args.previous_manifest, args.compatibility_mode, 7)
+    previous = load_previous_manifest(args.previous_manifest) if args.previous_manifest else None
+    if previous and previous.get("stage") not in {5, 6}:
+        raise ValueError("阶段 7 上一阶段 manifest 必须来自阶段 5 或 6")
+    artifact_dir = Path(args.artifact_dir or (Path(args.previous_manifest).parent if args.previous_manifest else "."))
     report_dir = Path(args.report_dir)
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    inventory = build_inventory(artifact_dir)
-    stage6_enabled = read_stage6_scope(artifact_dir / "00_modeling_config.yaml")
-    confirmed_decisions, decision_issues = read_confirmed_decisions(artifact_dir, stage6_enabled)
+    inventory = build_inventory_from_manifest(previous) if previous else build_inventory(artifact_dir)
+    config_path = Path(previous["config_snapshot"]) if previous else artifact_dir / "00_modeling_config.yaml"
+    stage6_enabled = read_stage6_scope(config_path)
+    decision_paths = None
+    if previous:
+        decision_paths = {}
+        for stage, filename in DECISION_FILES.items():
+            key = Path(filename).stem
+            if key in previous.get("outputs", {}):
+                decision_paths[stage] = Path(previous["outputs"][key])
+    confirmed_decisions, decision_issues = read_confirmed_decisions(artifact_dir, stage6_enabled, decision_paths)
     issues = find_report_issues(inventory, stage6_enabled, decision_issues)
     inventory.to_csv(report_dir / "07_artifact_inventory.csv", index=False, encoding="utf-8-sig")
     issues.to_csv(report_dir / "07_report_issues.csv", index=False, encoding="utf-8-sig")

@@ -92,13 +92,19 @@ def write_stage_manifest(
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     snapshot = snapshot_config(config_path, output, stage)
+    declared_outputs = {}
+    previous_manifest = inputs.get("previous_manifest")
+    if previous_manifest and Path(str(previous_manifest)).is_file():
+        previous = json.loads(Path(str(previous_manifest)).read_text(encoding="utf-8"))
+        declared_outputs.update(previous.get("outputs", {}))
+    declared_outputs.update({k: str(Path(v).resolve()) for k, v in outputs.items()})
     manifest = {
         "stage": stage,
         "status": status,
         "created_at": now_iso(),
         "config_snapshot": str(snapshot),
         "inputs": {k: str(v) for k, v in inputs.items()},
-        "outputs": {k: str(Path(v).resolve()) for k, v in outputs.items()},
+        "outputs": declared_outputs,
         "pending_decisions": pending_decisions,
         "next_stage": next_stage,
     }
