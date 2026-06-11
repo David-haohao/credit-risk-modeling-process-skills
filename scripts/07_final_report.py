@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import html
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
 
@@ -19,6 +20,9 @@ REQUIRED_PATTERNS = [
     "04-output-list.xlsx",
     "05-output-list.xlsx",
     "05_evaluation_decisions.csv",
+]
+
+STAGE6_REQUIRED_PATTERNS = [
     "06-output-list.xlsx",
     "06_scoring_decisions.csv",
     "06_scoring_parameters.json",
@@ -41,11 +45,29 @@ def build_inventory(artifact_dir: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def find_report_issues(inventory: pd.DataFrame) -> pd.DataFrame:
+def read_stage6_scope(config_path: Path) -> Optional[bool]:
+    """读取阶段 0 配置中的 enable_stage6_scoring。"""
+    if not config_path.exists():
+        return None
+    for line in config_path.read_text(encoding="utf-8-sig").splitlines():
+        key, separator, value = line.partition(":")
+        if separator and key.strip() == "enable_stage6_scoring":
+            normalized = value.split("#", 1)[0].strip().strip("'\"").lower()
+            if normalized in {"true", "yes", "1"}:
+                return True
+            if normalized in {"false", "no", "0"}:
+                return False
+    return None
+
+
+def find_report_issues(
+    inventory: pd.DataFrame, stage6_enabled: Optional[bool],
+) -> pd.DataFrame:
     """检查最终报告必需产物是否存在。"""
     available = set(inventory["artifact"]) if not inventory.empty else set()
     rows = []
-    for index, artifact in enumerate(REQUIRED_PATTERNS, start=1):
+    required = REQUIRED_PATTERNS + (STAGE6_REQUIRED_PATTERNS if stage6_enabled is True else [])
+    for index, artifact in enumerate(required, start=1):
         if artifact not in available:
             rows.append({
                 "issue_id": f"R{index:03d}",
@@ -58,14 +80,29 @@ def find_report_issues(inventory: pd.DataFrame) -> pd.DataFrame:
                 "confirmed_by": "",
                 "confirmed_at": "",
             })
+    if stage6_enabled is None:
+        rows.append({
+            "issue_id": "RSCOPE",
+            "issue_type": "unconfirmed_decision",
+            "source_stage": "00",
+            "artifact": "00_modeling_config.yaml",
+            "description": "enable_stage6_scoring 缺失或无法识别",
+            "decision": "pending",
+            "reason": "",
+            "confirmed_by": "",
+            "confirmed_at": "",
+        })
     return pd.DataFrame(rows)
 
 
 def render_html(
-    inventory: pd.DataFrame, issues: pd.DataFrame, artifact_dir: Path, output_path: Path,
+    inventory: pd.DataFrame, issues: pd.DataFrame, artifact_dir: Path,
+    stage6_enabled: Optional[bool], output_path: Path,
 ) -> None:
     """生成不重新计算指标的最终报告与交付清单。"""
     body = ["<h1>A卡建模报告</h1>"]
+    if stage6_enabled is False:
+        body.append("<p>本项目已在阶段0确认不执行阶段6概率校准与评分转换。</p>")
     for stage in range(7):
         stage_files = inventory[inventory["relative_path"].str.match(fr"(^|.*/)0{stage}[_-]")]
         body.append(f"<h2>阶段 {stage}</h2>")
@@ -104,10 +141,14 @@ def main() -> None:
     report_dir.mkdir(parents=True, exist_ok=True)
 
     inventory = build_inventory(artifact_dir)
-    issues = find_report_issues(inventory)
+    stage6_enabled = read_stage6_scope(artifact_dir / "00_modeling_config.yaml")
+    issues = find_report_issues(inventory, stage6_enabled)
     inventory.to_csv(report_dir / "07_artifact_inventory.csv", index=False, encoding="utf-8-sig")
     issues.to_csv(report_dir / "07_report_issues.csv", index=False, encoding="utf-8-sig")
-    render_html(inventory, issues, artifact_dir, report_dir / "07_A卡建模报告.html")
+    render_html(
+        inventory, issues, artifact_dir, stage6_enabled,
+        report_dir / "07_A卡建模报告.html",
+    )
     with pd.ExcelWriter(report_dir / "07-output-list.xlsx") as writer:
         inventory.to_excel(writer, sheet_name="artifact_inventory", index=False)
         issues.to_excel(writer, sheet_name="report_issues", index=False)

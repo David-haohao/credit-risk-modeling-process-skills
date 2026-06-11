@@ -16,6 +16,7 @@ description: "Use when building or reviewing an application credit scorecard wor
 ## 全局约束
 
 - 首先确认 Y_label 含义、模型类型、时间字段和样本唯一标识。
+- 项目开始时必须确认是否执行阶段 6 概率校准与评分转换，并写入 `enable_stage6_scoring`。选择不执行时，阶段 5 验收通过后直接进入阶段 7。
 - 每次开始新的建模任务时，必须向用户确认以下路径，并写入 `00_modeling_config.yaml`：
   - 原始数据路径
   - 过程代码存放路径
@@ -26,7 +27,7 @@ description: "Use when building or reviewing an application credit scorecard wor
 - 仅使用 Train 拟合筛选规则、分箱、转换器、校准器和模型；对 Test/OOT 只应用已拟合规则。
 - LR 使用 Train + OOT，并在 Train 内执行交叉验证。
 - XGBoost/LightGBM 使用 Train + Test + OOT，Test 用于调参，OOT 用于最终泛化评估。
-- 灰样本不参与训练和评估，在评分阶段单独处理。
+- 灰样本不参与训练和评估；仅在启用阶段 6 时单独评分。
 - 所有需要人工确认的项目在确认前保持 `pending`；关键项存在 `pending` 时不得进入下一阶段。
 - 所有 CSV 使用 UTF-8-SIG，其他文本使用 UTF-8。
 
@@ -40,7 +41,7 @@ description: "Use when building or reviewing an application credit scorecard wor
 | 3 | 特征工程、筛选、分箱与 WOE | `references/3-feature-engineering.md` |
 | 4 | LR / XGBoost / LightGBM 训练 | `references/4-model-training.md`；仅当 `model_type` 为 XGB/LGB 时额外读取 `references/4.1-xgb-lgb-tuning.md` |
 | 5 | KS / AUC / LIFT / PSI / 校准度评估 | `references/5-model-evaluation.md` |
-| 6 | 概率校准、分数映射与风险等级 | `references/6-scorecard.md` |
+| 6 | 概率校准、分数映射与风险等级（仅当 `enable_stage6_scoring=true`） | `references/6-scorecard.md` |
 | 7 | 最终报告汇总与交付 | `references/7-final-report.md` |
 
 ## 执行方式
