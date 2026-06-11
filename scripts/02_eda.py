@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import toad
+from stage_contracts import load_config, load_previous_manifest, require_formal_entry, write_output_list, write_stage_manifest
 
 
 # =============================================================================
@@ -275,6 +277,9 @@ def parse_args() -> argparse.Namespace:
         description="阶段 2：EDA 数据探索性分析"
     )
     parser.add_argument("--input", required=True, help="训练集 CSV 路径（阶段 1 输出）")
+    parser.add_argument("--previous-manifest")
+    parser.add_argument("--compatibility-mode", action="store_true")
+    parser.add_argument("--config")
     parser.add_argument("--target-col", required=True, help="Y_label 列名")
     parser.add_argument("--time-col", required=True, help="时间列名")
     parser.add_argument("--sample-id-col", default="sample_id", help="样本唯一标识列")
@@ -288,6 +293,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    require_formal_entry(args.previous_manifest, args.compatibility_mode, 2)
+    manifest = load_previous_manifest(args.previous_manifest, 1) if args.previous_manifest else None
+    config_path = Path(args.config or (manifest or {}).get("config_snapshot", ""))
+    config = load_config(config_path) if config_path.exists() else {}
+    fields = config.get("fields", {})
+    args.target_col = fields.get("target_col", args.target_col)
+    args.time_col = fields.get("time_col", args.time_col)
+    args.sample_id_col = fields.get("sample_id_col") or args.sample_id_col
 
     import os as _os
     _os.makedirs(args.output_dir, exist_ok=True)
@@ -372,6 +385,17 @@ def main() -> None:
         "feature", "issue_type", "issue_metric", "suggested_action",
         "decision", "decision_detail", "confirmed_by", "confirmed_at",
     ]).to_csv(f"{args.output_dir}/02_quality_decisions.csv", index=False, encoding="utf-8-sig")
+    output = Path(args.output_dir)
+    decisions = pd.DataFrame(quality_decisions)
+    summary = pd.DataFrame([{"status": "completed", "train_rows": len(df),
+                             "optional_quality_checks_configured": bool(config.get("eda_quality_thresholds"))}])
+    artifacts = list(output.glob("02_*"))
+    write_output_list(output / "02-output-list.xlsx", summary, artifacts, decisions)
+    outputs = {path.stem: path for path in output.glob("02_*")}
+    outputs["output_list"] = output / "02-output-list.xlsx"
+    pending = decisions.loc[decisions["decision"].eq("pending")].to_dict("records") if not decisions.empty else []
+    write_stage_manifest(output, 2, "completed", config_path, {"previous_manifest": args.previous_manifest or ""},
+                         outputs, pending, 3)
 
     print(f"\nEDA 输出已保存至: {args.output_dir}")
 

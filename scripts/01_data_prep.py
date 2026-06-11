@@ -4,12 +4,19 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+from pathlib import Path
 import sys
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from stage_contracts import (
+    load_config, load_previous_manifest, require_formal_entry, write_config,
+    write_output_list, write_stage_manifest,
+)
 
 
 # =============================================================================
@@ -49,6 +56,22 @@ def split_oot_by_recent_months(
     print(f"建模样本: {len(modeling_data)} 条")
     print(f"OOT 样本:  {len(oot_data)} 条")
 
+    return modeling_data, oot_data
+
+
+def split_oot_by_proportion(
+    data: pd.DataFrame, time_col: str, proportion: float,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """按时间排序取末尾样本比例；边界同一时间点整体进入 OOT。"""
+    if not 0 < proportion < 1:
+        raise ValueError("OOT 比例必须位于 0 和 1 之间")
+    ordered = data.copy()
+    ordered[time_col] = pd.to_datetime(ordered[time_col])
+    ordered = ordered.sort_values(time_col, kind="stable")
+    boundary_index = max(0, int(np.floor(len(ordered) * (1 - proportion))))
+    boundary_time = ordered.iloc[boundary_index][time_col]
+    oot_data = ordered[ordered[time_col] >= boundary_time].copy()
+    modeling_data = ordered[ordered[time_col] < boundary_time].copy()
     return modeling_data, oot_data
 
 
@@ -160,7 +183,17 @@ def ensure_sample_id(data: pd.DataFrame, sample_id_col: Optional[str]) -> pd.Dat
         if sample_id_col != "sample_id":
             data = data.drop(columns=[sample_id_col])
     else:
-        data["sample_id"] = [f"S{i:012d}" for i in range(len(data))]
+        normalized = data.astype("string").fillna("__MISSING__")
+        content_hash = normalized.apply(
+            lambda row: hashlib.sha256(
+                json.dumps(row.tolist(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:24],
+            axis=1,
+        )
+        duplicate_order = content_hash.groupby(content_hash).cumcount()
+        data["sample_id"] = [
+            f"H{digest}-{order:04d}" for digest, order in zip(content_hash, duplicate_order)
+        ]
     return data
 
 
@@ -173,17 +206,21 @@ def parse_args() -> argparse.Namespace:
         description="阶段 1：数据准备与样本划分"
     )
     parser.add_argument("--input", required=True, help="输入 CSV 路径")
+    parser.add_argument("--previous-manifest", help="阶段 0 正式交接 manifest")
+    parser.add_argument("--compatibility-mode", action="store_true", help="允许直接文件参数运行")
+    parser.add_argument("--config", help="00_modeling_config.yaml")
     parser.add_argument("--target-col", required=True, help="Y_label 列名")
     parser.add_argument("--time-col", required=True, help="时间列名")
     parser.add_argument("--sample-id-col", help="原始样本唯一标识列；未提供时按原始行号生成 sample_id")
     parser.add_argument("--output-dir", default="./output", help="输出目录")
     parser.add_argument("--model-type", choices=["LR", "XGB", "LGB"], default="XGB",
                         help="模型类型：LR 两段划分，XGB/LGB 三段划分")
-    parser.add_argument("--oot-method", choices=["date", "months"], default="months",
+    parser.add_argument("--oot-method", choices=["date", "months", "proportion"], default="months",
                         help="OOT 切分方式")
     parser.add_argument("--oot-start-date", help="OOT 起始日期（oot-method=date 时使用）")
     parser.add_argument("--oot-months", type=int, default=3,
                         help="OOT 最近 N 个月（oot-method=months 时使用）")
+    parser.add_argument("--oot-proportion", type=float, help="按时间排序取末尾样本比例")
     parser.add_argument("--test-size", type=float, default=0.3,
                         help="Test 集比例（默认 0.3）")
     parser.add_argument("--sample-method", choices=["full", "stratified"], default="full",
@@ -197,6 +234,20 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    require_formal_entry(args.previous_manifest, args.compatibility_mode, 1)
+    manifest = load_previous_manifest(args.previous_manifest, 0) if args.previous_manifest else None
+    config_path = Path(args.config or (manifest or {}).get("outputs", {}).get("config", ""))
+    config = load_config(config_path) if config_path.exists() else {}
+    fields = config.get("fields", {})
+    split_config = config.get("sample_split", {})
+    args.target_col = fields.get("target_col", args.target_col)
+    args.time_col = fields.get("time_col", args.time_col)
+    args.sample_id_col = fields.get("sample_id_col", args.sample_id_col)
+    args.model_type = config.get("model_type", args.model_type)
+    args.oot_method = split_config.get("oot_method", args.oot_method)
+    args.oot_start_date = split_config.get("oot_start_date", args.oot_start_date)
+    args.oot_months = split_config.get("oot_months", args.oot_months)
+    args.oot_proportion = split_config.get("oot_proportion", args.oot_proportion)
 
     df = pd.read_csv(args.input, sep=args.sep, encoding="utf-8-sig")
     df = ensure_sample_id(df, args.sample_id_col)
@@ -211,8 +262,12 @@ def main() -> None:
             print("错误: oot-method=date 时必须提供 --oot-start-date")
             sys.exit(1)
         modeling_data, oot_data = split_oot_by_date(clean_data, args.time_col, args.oot_start_date)
-    else:
+    elif args.oot_method == "months":
         modeling_data, oot_data = split_oot_by_recent_months(clean_data, args.time_col, args.oot_months)
+    else:
+        if args.oot_proportion is None:
+            raise ValueError("oot-method=proportion 时必须确认 oot_proportion")
+        modeling_data, oot_data = split_oot_by_proportion(clean_data, args.time_col, args.oot_proportion)
 
     # 建模样本内部切分：LR 使用 Train + OOT；树模型使用 Train + Test + OOT
     if args.model_type == "LR":
@@ -243,6 +298,48 @@ def main() -> None:
 
     if len(grey_samples) > 0:
         grey_samples.to_csv(f"{args.output_dir}/01_grey_samples.csv", index=False, encoding="utf-8-sig")
+
+    output = Path(args.output_dir)
+    split_audit = pd.DataFrame([
+        {"dataset": name, "rows": len(frame), "bad_rate": frame[args.target_col].mean(),
+         "time_min": frame[args.time_col].min(), "time_max": frame[args.time_col].max()}
+        for name, frame in [("train", train), ("test", test), ("oot", oot_data)]
+        if frame is not None
+    ])
+    split_audit.to_csv(output / "01_split_audit.csv", index=False, encoding="utf-8-sig")
+    id_audit = pd.DataFrame([{
+        "method": "source_column" if args.sample_id_col else "content_hash",
+        "null_count": int(df["sample_id"].isna().sum()),
+        "duplicate_count": int(df["sample_id"].duplicated().sum()),
+    }])
+    id_audit.to_csv(output / "01_sample_id_audit.csv", index=False, encoding="utf-8-sig")
+    sampling_audit = pd.DataFrame([{
+        "method": args.sample_method, "target_total": args.target_total,
+        "train_rows": len(train), "has_sample_weight": "sample_weight" in train,
+    }])
+    sampling_audit.to_csv(output / "01_sampling_audit.csv", index=False, encoding="utf-8-sig")
+    config.setdefault("sample_split", {}).update({
+        "oot_method": args.oot_method, "oot_start_date": args.oot_start_date,
+        "oot_months": args.oot_months, "oot_proportion": args.oot_proportion,
+        "test_size": args.test_size, "random_state": args.random_state,
+    })
+    if config_path:
+        write_config(config_path, config)
+    outputs = {
+        "train": output / "01_train.csv", "oot": output / "01_oot.csv",
+        "missing_report": output / "01_missing_report.csv",
+        "split_audit": output / "01_split_audit.csv",
+        "sample_id_audit": output / "01_sample_id_audit.csv",
+        "sampling_audit": output / "01_sampling_audit.csv",
+    }
+    if test is not None:
+        outputs["test"] = output / "01_test.csv"
+    if len(grey_samples) > 0:
+        outputs["grey"] = output / "01_grey_samples.csv"
+    summary = pd.DataFrame([{"model_type": args.model_type, "oot_method": args.oot_method, "status": "completed"}])
+    write_output_list(output / "01-output-list.xlsx", summary, list(outputs.values()))
+    outputs["output_list"] = output / "01-output-list.xlsx"
+    write_stage_manifest(output, 1, "completed", config_path, {"previous_manifest": args.previous_manifest or ""}, outputs, [], 2)
 
     print(f"\n输出已保存至: {args.output_dir}")
     print(f"  train: {len(train)} 条")

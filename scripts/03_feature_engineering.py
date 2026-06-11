@@ -8,12 +8,14 @@ import json
 import os
 import pickle
 import sys
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import toad
 from smoothed_woe import SmoothedWOETransformer
+from stage_contracts import load_config, load_previous_manifest, require_formal_entry, write_config, write_output_list, write_stage_manifest
 
 
 ADJUSTMENT_COLUMNS = [
@@ -21,6 +23,39 @@ ADJUSTMENT_COLUMNS = [
     "before_iv", "after_iv", "before_monotonic", "after_monotonic", "u_shape_candidate",
     "decision_reason", "confirmed_by", "confirmed_at",
 ]
+
+
+def apply_quality_actions(
+    datasets: dict[str, pd.DataFrame], decisions: pd.DataFrame,
+) -> tuple[dict[str, pd.DataFrame], pd.DataFrame]:
+    """Apply confirmed structured cap, replace, and category-merge actions."""
+    result = {name: frame.copy() for name, frame in datasets.items()}
+    audit = []
+    for row in decisions.to_dict("records"):
+        decision = row.get("decision")
+        if decision not in {"cap", "transform"}:
+            continue
+        feature = row["feature"]
+        try:
+            detail = json.loads(row.get("decision_detail") or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{feature} 的 decision_detail 不是有效 JSON") from exc
+        action = "cap" if decision == "cap" else detail.get("action")
+        if action == "cap":
+            if "lower" not in detail and "upper" not in detail:
+                raise ValueError(f"{feature} cap 必须提供 lower 或 upper")
+            for frame in result.values():
+                frame[feature] = frame[feature].clip(lower=detail.get("lower"), upper=detail.get("upper"))
+        elif action in {"replace", "merge_categories"}:
+            mapping = detail.get("mapping")
+            if not isinstance(mapping, dict):
+                raise ValueError(f"{feature} {action} 必须提供 mapping")
+            for frame in result.values():
+                frame[feature] = frame[feature].replace(mapping)
+        else:
+            raise ValueError(f"不支持的质量处理动作: {action}")
+        audit.append({"feature": feature, "action": action, "decision_detail": json.dumps(detail, ensure_ascii=False)})
+    return result, pd.DataFrame(audit)
 
 
 # =============================================================================
@@ -488,6 +523,9 @@ def parse_args() -> argparse.Namespace:
         description="阶段 3：特征工程"
     )
     parser.add_argument("--train", required=True, help="训练集 CSV（阶段 1 输出）")
+    parser.add_argument("--previous-manifest")
+    parser.add_argument("--compatibility-mode", action="store_true")
+    parser.add_argument("--config")
     parser.add_argument("--test", help="测试集 CSV（XGB/LGB 路径必需）")
     parser.add_argument("--oot", required=True, help="OOT CSV（阶段 1 输出）")
     parser.add_argument("--target-col", required=True, help="Y_label 列名")
@@ -521,6 +559,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    require_formal_entry(args.previous_manifest, args.compatibility_mode, 3)
+    manifest = load_previous_manifest(args.previous_manifest, 2) if args.previous_manifest else None
+    config_path = Path(args.config or (manifest or {}).get("config_snapshot", ""))
+    config = load_config(config_path) if config_path.exists() else {}
+    fields = config.get("fields", {})
+    stage3_config = config.get("stage3", {})
+    args.target_col = fields.get("target_col", args.target_col)
+    args.time_col = fields.get("time_col", args.time_col)
+    args.model_type = config.get("model_type", args.model_type)
+    if stage3_config.get("iv_threshold") not in {None, "pending"}:
+        args.iv_threshold = float(stage3_config["iv_threshold"])
+    if stage3_config.get("corr_threshold") not in {None, "pending"}:
+        args.corr_threshold = float(stage3_config["corr_threshold"])
     import os as _os
     _os.makedirs(args.output_dir, exist_ok=True)
 
@@ -547,8 +598,14 @@ def main() -> None:
         if not pending_leakage.empty:
             raise ValueError("存在未确认的时间泄露候选特征，不能继续阶段 3")
         custom_actions = quality[quality["decision"].isin(["transform", "cap"])]
-        if not custom_actions.empty:
-            raise ValueError("存在 transform/cap 质量决策，请先在项目代码中实现对应处理")
+        datasets = {"train": train, "oot": oot}
+        if test is not None:
+            datasets["test"] = test
+        datasets, quality_action_audit = apply_quality_actions(datasets, custom_actions)
+        train, oot, test = datasets["train"], datasets["oot"], datasets.get("test")
+        quality_action_audit.to_csv(
+            f"{args.output_dir}/03_quality_action_audit.csv", index=False, encoding="utf-8-sig",
+        )
         drop_quality = set(quality.loc[quality["decision"] == "drop", "feature"])
         active_features = [c for c in active_features if c not in drop_quality]
 
@@ -782,6 +839,29 @@ def main() -> None:
             train, test, oot, final_cols, args.target_col,
             reserved_cols, args.output_dir, is_woe=False,
         )
+
+    output = Path(args.output_dir)
+    selected_set = set(final_cols)
+    feature_decisions = pd.DataFrame([{
+        "feature": feature,
+        "final_status": "selected" if feature in selected_set else "dropped",
+        "reason": "final_feature_set" if feature in selected_set else "feature_screening",
+    } for feature in active_features])
+    feature_decisions.to_csv(output / "03_feature_decisions.csv", index=False, encoding="utf-8-sig")
+    config.setdefault("stage3", {}).update({
+        "iv_threshold": args.iv_threshold, "corr_threshold": args.corr_threshold,
+        "woe_smooth": args.woe_smooth,
+    })
+    write_config(config_path, config)
+    summary = pd.DataFrame([{"status": "completed", "model_type": args.model_type,
+                             "final_feature_count": len(final_cols)}])
+    artifacts = list(output.glob("03_*"))
+    write_output_list(output / "03-output-list.xlsx", summary, artifacts,
+                      extra_sheets={"feature_decisions": feature_decisions})
+    outputs = {path.stem: path for path in output.glob("03_*")}
+    outputs["output_list"] = output / "03-output-list.xlsx"
+    write_stage_manifest(output, 3, "completed", config_path,
+                         {"previous_manifest": args.previous_manifest or ""}, outputs, [], 4)
 
     print(f"\n特征工程完成。最终特征数: {len(final_cols)}")
 

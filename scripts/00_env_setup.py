@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import importlib
 import os
+from pathlib import Path
 import sys
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from stage_contracts import write_config, write_output_list, write_stage_manifest
 
 
 # =============================================================================
@@ -30,6 +32,7 @@ REQUIRED_PACKAGES: dict[str, str] = {
     "sklearn": "0.24+",
     "scipy": "1.5+",
     "statsmodels": "0.12+",
+    "yaml": "6.0+",
 }
 
 
@@ -154,7 +157,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="阶段 0：环境初始化与数据预检"
     )
-    parser.add_argument("--filepath", required=True, help="数据文件路径（csv/xlsx/parquet）")
+    parser.add_argument("--filepath", help="数据文件路径（csv/xlsx/parquet）")
+    parser.add_argument("--output-dir", default="./output")
+    parser.add_argument("--config-template", action="store_true", help="生成待确认配置模板")
     parser.add_argument("--check-packages", action="store_true", help="检查依赖包")
     parser.add_argument("--missing-markers", nargs="*", type=float,
                         default=[-9999, -999], help="特殊缺失值标识，默认 -9999 -999")
@@ -163,6 +168,26 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    output = Path(args.output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    config_path = output / "00_modeling_config.yaml"
+    if args.config_template or not config_path.exists():
+        write_config(config_path, {
+            "project": {"name": "pending", "created_at": "pending"},
+            "paths": {"raw_data_path": args.filepath or "pending", "code_dir": "pending",
+                      "intermediate_dir": str(output.resolve()), "report_dir": "pending"},
+            "fields": {"target_col": "pending", "time_col": "pending", "sample_id_col": None,
+                       "sample_id_source_cols": [], "sample_weight_col": "sample_weight"},
+            "model_type": "pending", "enable_stage6_scoring": "pending",
+            "psi_period_granularity": "pending", "sample_split": {"oot_method": "pending"},
+            "stage3": {"iv_threshold": "pending", "corr_threshold": 0.7},
+            "scoring": {"base_score": "pending", "base_odds": "pending", "pdo": "pending"},
+        })
+        if not args.filepath:
+            print(f"配置模板已生成: {config_path}")
+            return
+    if not args.filepath:
+        raise ValueError("执行数据预检时必须提供 --filepath")
 
     if args.check_packages:
         ok = check_packages()
@@ -179,6 +204,21 @@ def main() -> None:
     if args.missing_markers:
         df = unify_missing(df, args.missing_markers)
         print(f"\n已将 {args.missing_markers} 统一转换为 NaN")
+    environment = pd.DataFrame([
+        {"package": pkg, "required_version": version,
+         "installed": importlib.util.find_spec(pkg) is not None}
+        for pkg, version in REQUIRED_PACKAGES.items()
+    ])
+    environment.to_csv(output / "00_environment_check.csv", index=False, encoding="utf-8-sig")
+    profile = pd.DataFrame([{"raw_data_path": str(Path(args.filepath).resolve()), "rows": n_rows,
+                             "columns": n_cols, "file_size_mb": file_size_mb}])
+    profile.to_csv(output / "00_data_profile.csv", index=False, encoding="utf-8-sig")
+    outputs = {"config": config_path, "environment_check": output / "00_environment_check.csv",
+               "data_profile": output / "00_data_profile.csv"}
+    summary = pd.DataFrame([{"status": "pending_confirmation", "raw_data_path": args.filepath}])
+    write_output_list(output / "00-output-list.xlsx", summary, list(outputs.values()), summary)
+    outputs["output_list"] = output / "00-output-list.xlsx"
+    write_stage_manifest(output, 0, "completed", config_path, {"raw_data": args.filepath}, outputs, [], 1)
 
 
 if __name__ == "__main__":
