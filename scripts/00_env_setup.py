@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import os
+import shutil
 from pathlib import Path
 import sys
 from typing import Any
@@ -150,6 +152,50 @@ def unify_missing(df: pd.DataFrame, markers: list[Any]) -> pd.DataFrame:
     return df
 
 
+def build_confirmation_checklist(config: dict[str, Any], filepath: str | None) -> pd.DataFrame:
+    paths = config.get("paths", {})
+    fields = config.get("fields", {})
+    split = config.get("sample_split", {})
+    missing = config.get("missing_definition", {})
+    checks = {
+        "paths.raw_data_path": paths.get("raw_data_path") or filepath,
+        "paths.code_dir": paths.get("code_dir"),
+        "paths.intermediate_dir": paths.get("intermediate_dir"),
+        "paths.report_dir": paths.get("report_dir"),
+        "fields.target_col": fields.get("target_col"),
+        "fields.time_col": fields.get("time_col"),
+        "fields.sample_id_col_or_source_cols": fields.get("sample_id_col") or fields.get("sample_id_source_cols"),
+        "model_type": config.get("model_type"),
+        "enable_stage6_scoring": config.get("enable_stage6_scoring"),
+        "psi_period_granularity": config.get("psi_period_granularity"),
+        "sample_split.oot_method": split.get("oot_method"),
+        "sample_split.sample_method": split.get("sample_method"),
+        "sample_split.confirmed_by_user": split.get("confirmed_by_user"),
+        "missing_definition.confirmed_by_user": missing.get("confirmed_by_user"),
+    }
+    rows = []
+    for key, value in checks.items():
+        is_pending = value is None or value == "" or value == "pending" or value is False or value == []
+        rows.append({
+            "config_item": key,
+            "current_value": json.dumps(value, ensure_ascii=False) if isinstance(value, (list, dict)) else value,
+            "decision": "pending" if is_pending else "confirmed",
+        })
+    return pd.DataFrame(rows)
+
+
+def materialize_workspace_scripts(code_dir: str | Path) -> list[Path]:
+    source_dir = Path(__file__).resolve().parent
+    target_dir = Path(code_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    copied: list[Path] = []
+    for path in source_dir.glob("*.py"):
+        target = target_dir / path.name
+        shutil.copyfile(path, target)
+        copied.append(target.resolve())
+    return copied
+
+
 # =============================================================================
 # CLI
 # =============================================================================
@@ -178,10 +224,13 @@ def main() -> None:
             "paths": {"raw_data_path": args.filepath or "pending", "code_dir": "pending",
                       "intermediate_dir": str(output.resolve()), "report_dir": "pending"},
             "fields": {"target_col": "pending", "time_col": "pending", "sample_id_col": None,
-                       "sample_id_source_cols": [], "sample_weight_col": "sample_weight"},
+                       "sample_id_source_cols": [], "sample_id_method": "pending",
+                       "sample_weight_col": "sample_weight"},
             "model_type": "pending", "enable_stage6_scoring": "pending",
-            "psi_period_granularity": "pending", "sample_split": {"oot_method": "pending"},
-            "stage3": {"iv_threshold": "pending", "corr_threshold": 0.7},
+            "psi_period_granularity": "pending",
+            "sample_split": {"oot_method": "pending", "sample_method": "pending", "confirmed_by_user": False},
+            "missing_definition": {"tokens": [], "blank_as_missing": True, "confirmed_by_user": False},
+            "stage3": {"iv_threshold": "pending", "corr_threshold": 0.7, "high_iv_threshold": 1.0},
             "scoring": {"base_score": "pending", "base_odds": "pending", "pdo": "pending"},
         })
         if not args.filepath:
@@ -219,23 +268,18 @@ def main() -> None:
     } for column in df.columns])
     profile.to_csv(output / "00_data_profile.csv", index=False, encoding="utf-8-sig")
     config = load_config(config_path)
-    checks = {
-        "paths.raw_data_path": config.get("paths", {}).get("raw_data_path"),
-        "paths.code_dir": config.get("paths", {}).get("code_dir"),
-        "paths.intermediate_dir": config.get("paths", {}).get("intermediate_dir"),
-        "paths.report_dir": config.get("paths", {}).get("report_dir"),
-        "fields.target_col": config.get("fields", {}).get("target_col"),
-        "fields.time_col": config.get("fields", {}).get("time_col"),
-        "model_type": config.get("model_type"),
-        "enable_stage6_scoring": config.get("enable_stage6_scoring"),
-        "psi_period_granularity": config.get("psi_period_granularity"),
-        "sample_split.oot_method": config.get("sample_split", {}).get("oot_method"),
-    }
-    required_pending = [{"config_item": key, "decision": "pending"} for key, value in checks.items()
-                        if value in {None, "", "pending"}]
+    checklist = build_confirmation_checklist(config, args.filepath)
+    checklist.to_csv(output / "00_confirmation_checklist.csv", index=False, encoding="utf-8-sig")
+    required_pending = checklist.loc[checklist["decision"].eq("pending"), ["config_item", "decision"]].to_dict("records")
     outputs = {"config": config_path, "environment_check": output / "00_environment_check.csv",
-               "data_profile": output / "00_data_profile.csv"}
+               "data_profile": output / "00_data_profile.csv",
+               "confirmation_checklist": output / "00_confirmation_checklist.csv"}
     status = "pending" if required_pending else "completed"
+    if status == "completed":
+        code_dir = config.get("paths", {}).get("code_dir")
+        if code_dir not in {None, "", "pending"}:
+            for i, path in enumerate(materialize_workspace_scripts(code_dir), start=1):
+                outputs[f"workspace_script_{i:02d}"] = path
     summary = pd.DataFrame([{"status": status, "raw_data_path": args.filepath}])
     write_output_list(output / "00-output-list.xlsx", summary, list(outputs.values()), pd.DataFrame(required_pending))
     outputs["00_output_list"] = output / "00-output-list.xlsx"

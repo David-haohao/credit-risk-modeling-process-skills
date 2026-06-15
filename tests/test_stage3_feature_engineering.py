@@ -104,6 +104,35 @@ class FeatureAdjustmentTests(unittest.TestCase):
 
         self.assertEqual(rule, [0.0, 2.0])
 
+    def test_build_high_iv_alerts_flags_extreme_iv_features(self):
+        iv_table = pd.DataFrame(
+            {
+                "column": ["stable_feature", "risky_feature"],
+                "iv": [0.12, 1.35],
+            }
+        )
+        alerts = STAGE3.build_high_iv_alerts(iv_table, threshold=1.0, stage_label="fast_iv")
+        self.assertEqual(alerts["feature"].tolist(), ["risky_feature"])
+        self.assertEqual(alerts.loc[0, "iv_stage"], "fast_iv")
+        self.assertEqual(alerts.loc[0, "decision"], "pending")
+
+    def test_binning_summary_contains_distribution_fields(self):
+        binned = pd.DataFrame(
+            {
+                "feature": [0, 0, 1, 1, 2, 2],
+                "target": [0, 1, 0, 0, 1, 1],
+            }
+        )
+        transformer, _ = STAGE3.run_woe(binned, "target", smooth=0.5)
+        details, _ = STAGE3.summarize_binning(
+            binned, "target", transformer, "before_adjustment"
+        )
+        expected_cols = {
+            "total_count", "good_count", "bad_count", "total_pct",
+            "good_pct", "bad_pct", "lift", "woe", "bad_rate", "iv_component",
+        }
+        self.assertTrue(expected_cols.issubset(set(details.columns)))
+
 
 if __name__ == "__main__":
     unittest.main()

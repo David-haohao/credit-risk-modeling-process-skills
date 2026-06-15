@@ -22,6 +22,7 @@ def load_script(name):
 
 
 CONTRACTS = load_script("stage_contracts.py")
+STAGE0 = load_script("00_env_setup.py")
 STAGE1 = load_script("01_data_prep.py")
 STAGE2 = load_script("02_eda.py")
 STAGE3 = load_script("03_feature_engineering.py")
@@ -69,6 +70,40 @@ class ContractTests(unittest.TestCase):
 
 
 class Stage1Tests(unittest.TestCase):
+    def test_stage0_confirmation_checklist_marks_blocking_items_pending(self):
+        config = {
+            "paths": {"raw_data_path": "raw.csv", "code_dir": "pending", "intermediate_dir": "out", "report_dir": "pending"},
+            "fields": {"target_col": "label", "time_col": "pending", "sample_id_col": None, "sample_id_source_cols": []},
+            "model_type": "pending",
+            "enable_stage6_scoring": "pending",
+            "psi_period_granularity": "pending",
+            "sample_split": {"oot_method": "pending", "sample_method": "pending", "confirmed_by_user": False},
+            "missing_definition": {"tokens": [], "blank_as_missing": True, "confirmed_by_user": False},
+        }
+        checklist = STAGE0.build_confirmation_checklist(config, "raw.csv")
+        pending_items = set(checklist.loc[checklist["decision"].eq("pending"), "config_item"])
+        self.assertIn("paths.code_dir", pending_items)
+        self.assertIn("paths.report_dir", pending_items)
+        self.assertIn("fields.time_col", pending_items)
+        self.assertIn("model_type", pending_items)
+        self.assertIn("sample_split.sample_method", pending_items)
+        self.assertIn("missing_definition.confirmed_by_user", pending_items)
+
+    def test_discover_sample_id_candidates_prefers_common_business_keys(self):
+        columns = ["apply_no", "mobile_md5", "idcard_md5", "feature_a"]
+        candidates = STAGE1.discover_sample_id_candidates(columns)
+        self.assertEqual(candidates[:3], ["apply_no", "mobile_md5", "idcard_md5"])
+
+    def test_stage1_rejects_unconfirmed_content_hash_fallback(self):
+        config = {
+            "fields": {"target_col": "label", "time_col": "app_dt", "sample_id_col": None, "sample_id_source_cols": []},
+            "sample_split": {"oot_method": "months", "sample_method": "full", "confirmed_by_user": True},
+            "missing_definition": {"tokens": [""], "blank_as_missing": True, "confirmed_by_user": True},
+            "model_type": "LR",
+        }
+        with self.assertRaises(ValueError):
+            STAGE1.validate_stage1_confirmations(config)
+
     def test_proportion_oot_keeps_same_timestamp_together(self):
         data = pd.DataFrame({
             "time": pd.to_datetime([
